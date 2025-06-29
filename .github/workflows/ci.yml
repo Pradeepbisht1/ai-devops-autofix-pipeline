@@ -19,12 +19,13 @@ jobs:
       with:
         python-version: 3.11
 
-    - name: Install Python dependencies
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        pip freeze  # Debug line (optional)
 
-    - name: Train Model
+    - name: Train ML Model
       run: python ml_model/train_model.py
 
     - name: Predict Build Status
@@ -34,10 +35,10 @@ jobs:
         echo "Predicted failure probability: $PROBABILITY"
         echo "fail_prob=$PROBABILITY" >> $GITHUB_OUTPUT
 
-    - name: Check Prediction and Deploy
+    - name: Allow Deploy if Safe
       if: ${{ steps.predict.outputs.fail_prob < 60 }}
-      run: echo "✅ Low risk! Proceeding to deploy..."
+      run: echo "✅ Safe build! Proceeding to deployment..."
 
-    - name: Block Deployment
+    - name: Block Deploy if High Risk
       if: ${{ steps.predict.outputs.fail_prob >= 60 }}
-      run: echo "🛑 High risk detected! Blocking deploy."
+      run: echo "🛑 Build has high failure risk. Deployment stopped."

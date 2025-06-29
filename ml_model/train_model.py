@@ -7,7 +7,7 @@ import joblib
 import os
 
 # 1. Load Data
-data_path = 'sample_pipeline_logs.csv'
+data_path = 'ml_model/sample_pipeline_logs.csv'
 df = pd.read_csv(data_path)
 
 # 2. Define features and labels

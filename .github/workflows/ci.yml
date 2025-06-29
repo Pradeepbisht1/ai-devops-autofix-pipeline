@@ -19,7 +19,7 @@ jobs:
       with:
         python-version: 3.11
 
-    - name: Install dependencies
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
@@ -36,8 +36,8 @@ jobs:
 
     - name: Check Prediction and Deploy
       if: ${{ steps.predict.outputs.fail_prob < 60 }}
-      run: echo " Low risk! Proceeding to deploy..."
+      run: echo "✅ Low risk! Proceeding to deploy..."
 
     - name: Block Deployment
       if: ${{ steps.predict.outputs.fail_prob >= 60 }}
-      run: echo " High risk detected! Blocking deploy."
+      run: echo "🛑 High risk detected! Blocking deploy."

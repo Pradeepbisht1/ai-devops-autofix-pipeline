@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: your-app-deployment
+  labels:
+    app: your-app-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: your-app-deployment
+  template:
+    metadata:
+      labels:
+        app: your-app-deployment
+    spec:
+      containers:
+      - name: app-container
+        image: <AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_REGION>.amazonaws.com/<ECR_REPO>:${GITHUB_SHA}
+        ports:
+        - containerPort: 5000
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5

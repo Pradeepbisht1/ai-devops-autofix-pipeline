@@ -11,30 +11,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repo
-      uses: actions/checkout@v3
+      - name: Checkout Repo
+        uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.11
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
 
-    - name: Install Dependencies
-      run: pip install requests
+      - name: Install Dependencies
+        run: pip install requests
 
-    - name: Configure kubectl
-      run: |
-        aws eks update-kubeconfig --region YOUR_REGION --name YOUR_EKS_CLUSTER_NAME
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION: YOUR_REGION
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region <YOUR_REGION> \
+            --name <YOUR_EKS_CLUSTER_NAME>
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: <YOUR_REGION>
 
-    - name: Run Smart Auto-Heal Script
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      run: |
-        python smart_auto_heal.py \
-          --deployment your-app-deployment \
-          --namespace default \
-          --replicas 3
+      - name: Run Smart Auto-Heal Script
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python smart_auto_heal.py \
+            --deployment <YOUR_DEPLOYMENT_NAME> \
+            --namespace default \
+            --replicas 3

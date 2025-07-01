@@ -19,7 +19,7 @@ jobs:
         AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
         ECR_REPO: ${{ secrets.ECR_REPO }}
       run: |
-        docker build -t $ECR_REPO:${{ github.sha }} app
+        docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} app
         aws ecr get-login-password --region $AWS_REGION \
           | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
         docker tag $ECR_REPO:${{ github.sha }} $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}

@@ -20,7 +20,10 @@ jobs:
 
       - name: Install kubectl
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          # Fetch the latest stable version tag
+          K8S_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+          # Download kubectl binary and save as 'kubectl'
+          curl -L "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
 
@@ -33,12 +36,12 @@ jobs:
 
       - name: Build & Push Docker Image to ECR
         run: |
-          # build app image
+          # Build app image
           docker build -t $ECR_REPO:${{ github.sha }} app
           docker tag $ECR_REPO:${{ github.sha }} \
             $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-          # login & push
+          # Login & push
           aws ecr get-login-password --region $AWS_REGION \
             | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
           docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
@@ -51,7 +54,7 @@ jobs:
 
       - name: Deploy to EKS
         run: |
-          # zero-downtime image update
+          # Zero-downtime image update
           kubectl set image deployment/your-app-deployment \
             app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }} \
             --record
@@ -60,9 +63,9 @@ jobs:
       - name: Predict Failure Probability
         id: predict
         run: |
-          # gather metrics (replace this with real metrics collection)
+          # Gather metrics (replace this with real metrics collection)
           echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
-          # run prediction script
+          # Run prediction script
           prob=$(python ml_model/predict_failure.py --input-json metrics.json)
           echo "fail_prob=$prob" >> $GITHUB_OUTPUT
 
@@ -71,13 +74,13 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          # perform auto-heal actions
+          # Perform auto-heal actions
           python pipeline/scripts/smart_auto_heal.py \
             --deployment your-app-deployment \
             --namespace default \
             --replicas 3
 
-          # send Slack notification
+          # Send Slack notification
           curl -X POST -H 'Content-type: application/json' \
             --data "{\"text\":\"Auto-heal triggered: rolled back or scaled to 3 replicas.\"}" \
             $SLACK_WEBHOOK_URL

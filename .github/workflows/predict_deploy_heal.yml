@@ -15,64 +15,69 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repo
-      uses: actions/checkout@v3
+      - name: Checkout Repo
+        uses: actions/checkout@v3
 
-    - name: Install AWS CLI v2 & kubectl
-      run: |
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-        unzip -qq awscliv2.zip
-        sudo ./aws/install
-        curl -LO "https://dl.k8s.io/release/$(curl -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region:             ${{ secrets.AWS_DEFAULT_REGION }}
+          aws-access-key-id:      ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-    - name: Build & Push Docker Image to ECR
-      run: |
-        docker build -t $ECR_REPO:${{ github.sha }} app
-        docker tag $ECR_REPO:${{ github.sha }} \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-        aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+      - name: Build & Push Docker Image to ECR
+        run: |
+          # build app image
+          docker build -t $ECR_REPO:${{ github.sha }} app
+          docker tag $ECR_REPO:${{ github.sha }} \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig \
-          --region $AWS_REGION \
-          --name ${{ secrets.EKS_CLUSTER_NAME }}
+          # login & push
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    - name: Deploy to EKS
-      run: |
-        # zero-downtime replacement
-        kubectl set image deployment/your-app-deployment \
-          app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }} \
-          --record
-        kubectl rollout status deployment/your-app-deployment --timeout=120s
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region $AWS_REGION \
+            --name ${{ secrets.EKS_CLUSTER_NAME }}
 
-    - name: Predict Failure Probability
-      id: predict
-      run: |
-        echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
-        prob=$(python ml_model/predict_failure.py --input-json metrics.json)
-        echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+      - name: Deploy to EKS
+        run: |
+          # zero-downtime image update
+          kubectl set image deployment/your-app-deployment \
+            app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }} \
+            --record
+          kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-    - name: Auto-Heal if Needed
-      if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      run: |
-        python pipeline/scripts/smart_auto_heal.py \
-          --deployment your-app-deployment \
-          --namespace default \
-          --replicas 3
-        curl -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\"Auto-heal triggered: rolled back or scaled to 3 replicas.\"}" \
-          $SLACK_WEBHOOK_URL
+      - name: Predict Failure Probability
+        id: predict
+        run: |
+          # gather metrics (replace this with real metrics collection)
+          echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
+          # run prediction script
+          prob=$(python ml_model/predict_failure.py --input-json metrics.json)
+          echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+
+      - name: Auto-Heal if Needed
+        if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # perform auto-heal actions
+          python pipeline/scripts/smart_auto_heal.py \
+            --deployment your-app-deployment \
+            --namespace default \
+            --replicas 3
+
+          # send Slack notification
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Auto-heal triggered: rolled back or scaled to 3 replicas.\"}" \
+            $SLACK_WEBHOOK_URL

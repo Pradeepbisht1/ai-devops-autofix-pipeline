@@ -53,6 +53,18 @@ jobs:
             app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
           kubectl rollout status deployment/your-app-deployment --timeout=120s
 
+      - name: Setup Python 3.x
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+
       - name: Predict Failure Probability
         id: predict
         run: |
@@ -61,7 +73,7 @@ jobs:
           echo "fail_prob=$prob" >> $GITHUB_OUTPUT
 
       - name: Auto-Heal if Needed
-        if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
+        if: ${{ steps.predict.outputs.fail_prob >= '0.75' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
@@ -69,6 +81,6 @@ jobs:
             --deployment your-app-deployment \
             --namespace default \
             --replicas 3
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"Auto-heal triggered: rolled back or scaled to 3 replicas.\"}" \
+          curl -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas.\"}" \
             $SLACK_WEBHOOK_URL

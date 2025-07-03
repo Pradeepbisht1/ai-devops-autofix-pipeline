@@ -38,6 +38,18 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --name ${{ secrets.EKS_CLUSTER_NAME }}
 
+      # ────── DEBUGGING BLOCK ──────
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity
+
+      - name: Show generated kubeconfig
+        run: kubectl config view
+
+      - name: Test kubectl connectivity
+        run: kubectl get nodes
+
+      # ────── end DEBUGGING ──────
+
       - name: Build & Push Docker Image to ECR
         run: |
           docker build -t $ECR_REPO:${{ github.sha }} app

@@ -39,22 +39,24 @@ jobs:
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
 
+      - name: Fetch EKS auth token (debug)
+        run: |
+          echo ">>> aws eks get-token output:"
+          aws eks get-token \
+            --region ${{ env.AWS_REGION }} \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }}
+
       - name: Configure kubectl for EKS
         run: |
           aws eks update-kubeconfig \
             --region ${{ env.AWS_REGION }} \
             --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
-      # ────── DEBUGGING BLOCK ──────
-      - name: Verify AWS credentials
-        run: aws sts get-caller-identity
-
       - name: Show generated kubeconfig
-        run: kubectl config view
+        run: kubectl config view --minify
 
       - name: Test kubectl connectivity
         run: kubectl get nodes
-      # ────── end DEBUGGING ──────
 
       - name: Build & Push Docker Image to ECR
         run: |

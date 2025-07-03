@@ -33,9 +33,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Configure kubectl for EKS
-        run: aws eks update-kubeconfig \
-               --region ${{ env.AWS_REGION }} \
-               --name ${{ secrets.EKS_CLUSTER_NAME }}
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ secrets.EKS_CLUSTER_NAME }}
 
       - name: Build & Push Docker Image to ECR
         run: |

@@ -90,10 +90,10 @@ jobs:
         run: |
           echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
           prob=$(python ml_model/predict_failure.py --input-json metrics.json)
-          echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+          echo "fail_prob=$prob" >> $GITHUB_ENV
 
       - name: Auto-Heal if Needed
-        if: ${{ steps.predict.outputs.fail_prob >= '0.75' }}
+        if: ${{ env.fail_prob >= '0.75' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
@@ -102,5 +102,5 @@ jobs:
             --namespace default \
             --replicas 3
           curl -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas.\"}" \
+            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=$FAIL_PROB).\"}" \
             $SLACK_WEBHOOK_URL

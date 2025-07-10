@@ -25,26 +25,19 @@ jobs:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Manually install AWS CLI v2
+      - name: Install AWS CLI v2
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          unzip -q awscliv2.zip
           sudo ./aws/install --update
           aws --version
 
       - name: Install kubectl
         run: |
-          K8S_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
-          curl -L "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+          K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
-
-      - name: Fetch EKS auth token (debug)
-        run: |
-          echo ">>> aws eks get-token output:"
-          aws eks get-token \
-            --region ${{ env.AWS_REGION }} \
-            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }}
 
       - name: Configure kubectl for EKS
         run: |
@@ -52,10 +45,7 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
-      - name: Show generated kubeconfig
-        run: kubectl config view --minify
-
-      - name: Test kubectl connectivity
+      - name: Verify Kubernetes Access
         run: kubectl get nodes
 
       - name: Build & Push Docker Image to ECR
@@ -63,8 +53,8 @@ jobs:
           docker build -t $ECR_REPO:${{ github.sha }} app
           docker tag $ECR_REPO:${{ github.sha }} \
             $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-          aws ecr get-login-password --region $AWS_REGION \
-            | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
           docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
       - name: Deploy to EKS
@@ -90,6 +80,7 @@ jobs:
         run: |
           echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
           prob=$(python ml_model/predict_failure.py --input-json metrics.json)
+          echo "fail_prob=$prob"
           echo "fail_prob=$prob" >> $GITHUB_ENV
 
       - name: Auto-Heal if Needed
@@ -101,6 +92,7 @@ jobs:
             --deployment your-app-deployment \
             --namespace default \
             --replicas 3
-          curl -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=$FAIL_PROB).\"}" \
+
+          curl -X POST -H "Content-Type: application/json" \
+            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${fail_prob}).\"}" \
             $SLACK_WEBHOOK_URL

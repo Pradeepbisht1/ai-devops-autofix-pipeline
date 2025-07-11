@@ -3,96 +3,115 @@ name: Predict, Deploy & Auto-Heal Pipeline
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ "*" ]          # run on every branch
+
+# ── GitHub-OIDC permissions ─────────────────────────────────────────────
+permissions:
+  id-token: write              # mint OIDC token
+  contents: read               # checkout repo
 
 env:
-  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-  AWS_REGION:     ${{ secrets.AWS_DEFAULT_REGION }}
-  ECR_REPO:       ${{ secrets.ECR_REPO }}
+  AWS_REGION:      ${{ secrets.AWS_REGION }}       # e.g. ap-southeast-2
+  AWS_ACCOUNT_ID:  ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPO:        ${{ secrets.ECR_REPO }}
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v3
+    - name: Checkout repo
+      uses: actions/checkout@v3
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-region:            ${{ env.AWS_REGION }}
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    # ── Assume github-actions-role via OIDC ────────────────────────────
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region:     ${{ env.AWS_REGION }}
 
-      - name: Install AWS CLI v2
-        run: |
-          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-          unzip -q awscliv2.zip
-          sudo ./aws/install --update
-          aws --version
+    # 🔍 DEBUG: show the exact caller ARN (helps if EKS auth fails)
+    - name: Show caller identity
+      run: aws sts get-caller-identity
 
-      - name: Install kubectl
-        run: |
-          K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-          curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+    # ── Tooling ────────────────────────────────────────────────────────
+    - name: Install AWS CLI v2
+      run: |
+        curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+          -o awscliv2.zip
+        unzip -q awscliv2.zip
+        sudo ./aws/install --update
+        aws --version
 
-      - name: Configure kubectl for EKS
-        run: |
-          aws eks update-kubeconfig \
-            --region ${{ env.AWS_REGION }} \
-            --name   ${{ secrets.EKS_CLUSTER_NAME }}
+    - name: Install kubectl
+      run: |
+        K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+        curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" \
+          -o kubectl
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
 
-      - name: Verify Kubernetes Access
-        run: kubectl get nodes
+    # ── Kubeconfig (same role) ────────────────────────────────────────
+    - name: Configure kubectl for EKS
+      run: |
+        aws eks update-kubeconfig \
+          --region  $AWS_REGION \
+          --name    ${{ secrets.EKS_CLUSTER_NAME }} \
+          --role-arn ${{ secrets.AWS_ROLE_ARN }}
 
-      - name: Build & Push Docker Image to ECR
-        run: |
-          docker build -t $ECR_REPO:${{ github.sha }} app
-          docker tag $ECR_REPO:${{ github.sha }} \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-          aws ecr get-login-password --region $AWS_REGION | \
-            docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+    - name: Verify Kubernetes access
+      run: kubectl get nodes
 
-      - name: Deploy to EKS
-        run: |
-          kubectl set image deployment/your-app-deployment \
-            app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-          kubectl rollout status deployment/your-app-deployment --timeout=120s
+    # ── Build & push container ────────────────────────────────────────
+    - name: Build & push Docker image to ECR
+      run: |
+        docker build -t $ECR_REPO:${{ github.sha }} app
+        docker tag  $ECR_REPO:${{ github.sha }} \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+        aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-      - name: Setup Python 3.x
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+    # ── Deploy to EKS ─────────────────────────────────────────────────
+    - name: Deploy to EKS
+      run: |
+        kubectl set image deployment/your-app-deployment \
+          app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+        kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-      - name: Install Python dependencies
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
+    # ── Python setup & inference ──────────────────────────────────────
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
 
-      - name: Predict Failure Probability
-        id: predict
-        run: |
-          echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
-          prob=$(python ml_model/predict_failure.py --input-json metrics.json)
-          echo "fail_prob=$prob"
-          echo "fail_prob=$prob" >> $GITHUB_ENV
+    - name: Install Python dependencies
+      run: |
+        if [ -f requirements.txt ]; then
+          pip install --upgrade pip
+          pip install -r requirements.txt
+        fi
 
-      - name: Auto-Heal if Needed
-        if: ${{ env.fail_prob >= '0.75' }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python pipeline/scripts/smart_auto_heal.py \
-            --deployment your-app-deployment \
-            --namespace default \
-            --replicas 3
+    - name: Predict failure probability
+      id: predict
+      run: |
+        echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
+        prob=$(python ml_model/predict_failure.py --input-json metrics.json)
+        echo "fail_prob=$prob" >> $GITHUB_ENV
+        echo "Predicted fail_prob: $prob"
 
-          curl -X POST -H "Content-Type: application/json" \
-            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${fail_prob}).\"}" \
-            $SLACK_WEBHOOK_URL
+    # ── Auto-heal (only if prob ≥ 0.75) ───────────────────────────────
+    - name: Auto-heal if needed
+      if: ${{ env.fail_prob && env.fail_prob >= '0.75' }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        python pipeline/scripts/smart_auto_heal.py \
+          --deployment your-app-deployment \
+          --namespace default \
+          --replicas 3
+
+        curl -X POST -H "Content-Type: application/json" \
+          --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${{ env.fail_prob }}).\"}" \
+          $SLACK_WEBHOOK_URL

@@ -13,6 +13,9 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_REPO:            ${{ secrets.ECR_REPO }}
+  MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}   # e.g. sklearn-inference
+  IMAGE_TAG:           "1.2-1-cpu-py3"                # model image tag
+  MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}   # e.g. s3://ai-devops-models-prod/model.tar.gz
 
 jobs:
   build-deploy-heal:
@@ -63,6 +66,23 @@ jobs:
           docker login --username AWS --password-stdin \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
         docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+
+    - name: Mirror SageMaker sklearn image into ECR
+      run: |
+        REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
+        docker pull public.ecr.aws/sagemaker/sklearn-inference:$IMAGE_TAG
+        docker tag public.ecr.aws/sagemaker/sklearn-inference:$IMAGE_TAG \
+          $REPO_URI:$IMAGE_TAG
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+          docker login --username AWS --password-stdin \
+          "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+        docker push $REPO_URI:$IMAGE_TAG
+        echo "MODEL_IMAGE_URI=$REPO_URI:$IMAGE_TAG" >> $GITHUB_ENV
+
+    - name: Upload model artifact to S3
+      run: aws s3 cp ml_model/models/model.tar.gz $MODEL_S3_PATH
+      env:
+        AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
 
     - name: Deploy to EKS
       run: |

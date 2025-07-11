@@ -3,15 +3,14 @@ name: Predict, Deploy & Auto-Heal Pipeline
 on:
   workflow_dispatch:
   push:
-    branches: [ "*" ]          # run on every branch
+    branches: [ "*" ]
 
-# ── GitHub-OIDC permissions ─────────────────────────────────────────────
 permissions:
-  id-token: write              # mint OIDC token
-  contents: read               # checkout repo
+  id-token: write
+  contents: read
 
 env:
-  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}  # e.g. ap-southeast-2
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_REPO:            ${{ secrets.ECR_REPO }}
 
@@ -23,22 +22,18 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v3
 
-    # ── Assume github-actions-role via OIDC ────────────────────────────
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
         aws-region:     ${{ env.AWS_DEFAULT_REGION }}
 
-    # 🔍 DEBUG: show the exact caller ARN
     - name: Show caller identity
       run: aws sts get-caller-identity
 
-    # ── Tooling ────────────────────────────────────────────────────────
     - name: Install AWS CLI v2
       run: |
-        curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
-          -o awscliv2.zip
+        curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
         unzip -q awscliv2.zip
         sudo ./aws/install --update
         aws --version
@@ -46,41 +41,35 @@ jobs:
     - name: Install kubectl
       run: |
         K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-        curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" \
-          -o kubectl
+        curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
         chmod +x kubectl
         sudo mv kubectl /usr/local/bin/
 
-    # ── Kubeconfig (same role) ────────────────────────────────────────
     - name: Configure kubectl for EKS
       run: |
         aws eks update-kubeconfig \
-          --region  $AWS_DEFAULT_REGION \
-          --name    ${{ secrets.EKS_CLUSTER_NAME }} \
-          --role-arn ${{ secrets.AWS_ROLE_ARN }}
+          --region $AWS_DEFAULT_REGION \
+          --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
     - name: Verify Kubernetes access
       run: kubectl get nodes
 
-    # ── Build & push container ────────────────────────────────────────
     - name: Build & push Docker image to ECR
       run: |
         docker build -t $ECR_REPO:${{ github.sha }} app
-        docker tag  $ECR_REPO:${{ github.sha }} \
+        docker tag $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
           docker login --username AWS --password-stdin \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
         docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    # ── Deploy to EKS ─────────────────────────────────────────────────
     - name: Deploy to EKS
       run: |
         kubectl set image deployment/your-app-deployment \
           app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-    # ── Python setup & inference ──────────────────────────────────────
     - name: Setup Python 3.10
       uses: actions/setup-python@v4
       with:
@@ -101,7 +90,6 @@ jobs:
         echo "fail_prob=$prob" >> $GITHUB_ENV
         echo "Predicted fail_prob: $prob"
 
-    # ── Auto-heal (only if prob ≥ 0.75) ───────────────────────────────
     - name: Auto-heal if needed
       if: ${{ env.fail_prob && env.fail_prob >= '0.75' }}
       env:

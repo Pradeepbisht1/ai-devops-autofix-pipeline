@@ -14,9 +14,9 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:     ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_REPO:           ${{ secrets.ECR_REPO }}
-  MODEL_ECR_REPO:     ${{ secrets.MODEL_ECR_REPO }}   # private repo name, ex: "sklearn-inference"
-  IMAGE_TAG:          "1.0-1-cpu-py3"                # valid public.ecr.aws tag
-  MODEL_S3_PATH:      ${{ secrets.MODEL_S3_PATH }}   # ex: "s3://ai-devops-models-prod/model.tar.gz"
+  MODEL_ECR_REPO:     ${{ secrets.MODEL_ECR_REPO }}   # private repo name, e.g. "sklearn-inference"
+  IMAGE_TAG:          "1.2-1-cpu-py3"                 # valid public.ecr.aws tag
+  MODEL_S3_PATH:      ${{ secrets.MODEL_S3_PATH }}   # e.g. "s3://ai-devops-models-prod/model.tar.gz"
 
 jobs:
   build-deploy-heal:
@@ -72,29 +72,29 @@ jobs:
 
       - name: Mirror SageMaker sklearn image into ECR
         run: |
-          # private repo URI
+          # Private ECR URI
           REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
           TAG="$IMAGE_TAG"
 
-          # 0) Authenticate to the public ECR registry
+          # 0) Authenticate to public ECR (avoid rate limits)
           aws ecr-public get-login-password --region us-east-1 \
             | docker login --username AWS --password-stdin public.ecr.aws
 
-          # 1) Pull the official SageMaker sklearn image using your MODEL_ECR_REPO variable
-          docker pull public.ecr.aws/sagemaker/$MODEL_ECR_REPO:$TAG
+          # 1) Pull the official SageMaker sklearn image (hard-coded repo name)
+          docker pull public.ecr.aws/sagemaker/sklearn-inference:$TAG
 
           # 2) Tag it into your private ECR
           docker tag \
-            public.ecr.aws/sagemaker/$MODEL_ECR_REPO:$TAG \
+            public.ecr.aws/sagemaker/sklearn-inference:$TAG \
             $REPO_URI:$TAG
 
-          # 3) Login to your private ECR & push
+          # 3) Login & push to private ECR
           aws ecr get-login-password --region $AWS_DEFAULT_REGION \
             | docker login --username AWS --password-stdin \
               $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
           docker push $REPO_URI:$TAG
 
-          # 4) Expose the resulting URI to later steps
+          # 4) Expose for later steps
           echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
 
       - name: Upload model artifact to S3

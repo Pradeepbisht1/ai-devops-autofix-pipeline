@@ -14,8 +14,8 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:     ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_REPO:           ${{ secrets.ECR_REPO }}
-  MODEL_ECR_REPO:     ${{ secrets.MODEL_ECR_REPO }}   # e.g. "sklearn-inference"
-  IMAGE_TAG:          "1.0-1-cpu-py3"                # valid public.ecr.aws tag
+  MODEL_ECR_REPO:     ${{ secrets.MODEL_ECR_REPO }}   # your private repo name: "sklearn-inference"
+  IMAGE_TAG:          "1.0-1-cpu-py3"                # pick a valid tag from the public ECR Gallery
   MODEL_S3_PATH:      ${{ secrets.MODEL_S3_PATH }}   # e.g. "s3://ai-devops-models-prod/model.tar.gz"
 
 jobs:
@@ -72,28 +72,30 @@ jobs:
 
       - name: Mirror SageMaker sklearn image into ECR
         run: |
+          # private repo URI
           REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
           TAG="$IMAGE_TAG"
 
-          # 1) pull from public ECR
+          # 1) Pull from the public gallery (literal repo name)
           docker pull public.ecr.aws/sagemaker/sklearn-inference:$TAG
 
-          # 2) tag into your private ECR
+          # 2) Tag into your own ECR
           docker tag \
             public.ecr.aws/sagemaker/sklearn-inference:$TAG \
             $REPO_URI:$TAG
 
-          # 3) login & push
+          # 3) Login & push
           aws ecr get-login-password --region $AWS_DEFAULT_REGION \
             | docker login --username AWS --password-stdin \
               $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
           docker push $REPO_URI:$TAG
 
-          # 4) expose for Terraform / SageMaker
+          # 4) Export for later steps
           echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
 
       - name: Upload model artifact to S3
-        run: aws s3 cp ml_model/models/model.tar.gz $MODEL_S3_PATH
+        run: |
+          aws s3 cp ml_model/models/model.tar.gz $MODEL_S3_PATH
 
       - name: Deploy app to EKS
         run: |
@@ -130,7 +132,6 @@ jobs:
             --deployment your-app-deployment \
             --namespace default \
             --replicas 3
-
           curl -X POST -H "Content-Type: application/json" \
             --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${{ env.fail_prob }}).\"}" \
             $SLACK_WEBHOOK_URL

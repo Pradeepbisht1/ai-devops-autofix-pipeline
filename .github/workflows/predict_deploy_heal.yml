@@ -70,22 +70,22 @@ jobs:
           docker push \
             $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-      - name: Mirror SageMaker sklearn image into ECR
+      - name: Mirror SageMaker scikit-learn image into ECR
         run: |
           # Private ECR URI
           REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
           TAG="$IMAGE_TAG"
 
-          # 0) Authenticate to public ECR (avoid rate limits)
+          # 0) Authenticate to public ECR (avoids rate limits)
           aws ecr-public get-login-password --region us-east-1 \
             | docker login --username AWS --password-stdin public.ecr.aws
 
-          # 1) Pull the official SageMaker sklearn image (hard-coded repo name)
-          docker pull public.ecr.aws/sagemaker/sklearn-inference:$TAG
+          # 1) Pull the official SageMaker scikit-learn inference image
+          docker pull public.ecr.aws/sagemaker-scikit-learn:$TAG
 
           # 2) Tag it into your private ECR
           docker tag \
-            public.ecr.aws/sagemaker/sklearn-inference:$TAG \
+            public.ecr.aws/sagemaker-scikit-learn:$TAG \
             $REPO_URI:$TAG
 
           # 3) Login & push to private ECR
@@ -94,7 +94,7 @@ jobs:
               $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
           docker push $REPO_URI:$TAG
 
-          # 4) Expose for later steps
+          # 4) Export the resulting URI for later steps
           echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
 
       - name: Upload model artifact to S3

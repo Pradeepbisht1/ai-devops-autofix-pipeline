@@ -11,130 +11,138 @@ permissions:
   contents: read
 
 env:
-  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-  AWS_ACCOUNT_ID:     ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:           ${{ secrets.ECR_REPO }}
-  MODEL_ECR_REPO:     ${{ secrets.MODEL_ECR_REPO }}   # private repo name, e.g. "sklearn-inference"
-  IMAGE_TAG:          "1.2-1-cpu-py3"                 # valid public.ecr.aws tag
-  MODEL_S3_PATH:      ${{ secrets.MODEL_S3_PATH }}   # e.g. "s3://ai-devops-models-prod/model.tar.gz"
+  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPO:            ${{ secrets.ECR_REPO }}
+  MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}
+  IMAGE_TAG:           "1.2-1-cpu-py3"
+  MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+    # ──────────────────────────  checkout & creds  ──────────────────────────
+    - name: Checkout repo
+      uses: actions/checkout@v3
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:     ${{ env.AWS_DEFAULT_REGION }}
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region:     ${{ env.AWS_DEFAULT_REGION }}
 
-      - name: Show caller identity
-        run: aws sts get-caller-identity
+    - name: Show caller identity
+      run: aws sts get-caller-identity
 
-      - name: Install AWS CLI v2
-        run: |
+    # ─────────────────────────────  tooling  ───────────────────────────────
+    - name: Install AWS CLI v2
+      run: |
+        if ! aws --version > /dev/null 2>&1; then
           curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
           unzip -q awscliv2.zip
           sudo ./aws/install --update
-          aws --version
+        fi
+        aws --version
 
-      - name: Install kubectl
-        run: |
-          K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-          curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+    - name: Install kubectl
+      run: |
+        K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+        curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+        chmod +x kubectl && sudo mv kubectl /usr/local/bin/
 
-      - name: Configure kubectl for EKS
-        run: |
-          aws eks update-kubeconfig \
-            --region $AWS_DEFAULT_REGION \
-            --name   ${{ secrets.EKS_CLUSTER_NAME }}
+    - name: Configure kubectl for EKS
+      run: |
+        aws eks update-kubeconfig \
+          --region $AWS_DEFAULT_REGION \
+          --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
-      - name: Verify Kubernetes access
-        run: kubectl get nodes
+    - name: Verify Kubernetes access
+      run: kubectl get nodes
 
-      - name: Build & push app Docker image to ECR
-        run: |
-          docker build -t $ECR_REPO:${{ github.sha }} app
-          docker tag \
-            $ECR_REPO:${{ github.sha }} \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-          aws ecr get-login-password --region $AWS_DEFAULT_REGION \
-            | docker login --username AWS --password-stdin \
-              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-          docker push \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+    # ──────────────────────  build & push app image  ───────────────────────
+    - name: Build & push APP image to ECR
+      run: |
+        docker build -t $ECR_REPO:${{ github.sha }} app
+        docker tag  $ECR_REPO:${{ github.sha }} \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-      - name: Mirror SageMaker scikit-learn image into ECR
-        run: |
-          # Private ECR URI
-          REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
-          TAG="$IMAGE_TAG"
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+          | docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
-          # 0) Authenticate to public ECR (avoids rate limits)
-          aws ecr-public get-login-password --region us-east-1 \
-            | docker login --username AWS --password-stdin public.ecr.aws
+        docker push \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-          # 1) Pull the official SageMaker scikit-learn inference image
-          docker pull public.ecr.aws/sagemaker-scikit-learn:$TAG
+    # ──────────────────  mirror SageMaker DLC → private ECR  ───────────────
+    - name: Mirror SageMaker scikit-learn DLC to private ECR
+      run: |
+        # Private ECR URI
+        REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
+        TAG="$IMAGE_TAG"
+        PUBLIC_REPO="public.ecr.aws/sagemaker/sagemaker-scikit-learn"
 
-          # 2) Tag it into your private ECR
-          docker tag \
-            public.ecr.aws/sagemaker-scikit-learn:$TAG \
-            $REPO_URI:$TAG
+        # 0) Authenticate to public ECR (avoid anonymous rate-limits)
+        aws ecr-public get-login-password --region us-east-1 \
+          | docker login --username AWS --password-stdin public.ecr.aws
 
-          # 3) Login & push to private ECR
-          aws ecr get-login-password --region $AWS_DEFAULT_REGION \
-            | docker login --username AWS --password-stdin \
-              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-          docker push $REPO_URI:$TAG
+        # 1) Pull the official image
+        docker pull $PUBLIC_REPO:$TAG
 
-          # 4) Export the resulting URI for later steps
-          echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
+        # 2) Tag into your private ECR namespace
+        docker tag $PUBLIC_REPO:$TAG $REPO_URI:$TAG
 
-      - name: Upload model artifact to S3
-        run: aws s3 cp ml_model/models/model.tar.gz $MODEL_S3_PATH
+        # 3) Login & push to private ECR
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+          | docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+        docker push $REPO_URI:$TAG
 
-      - name: Deploy app to EKS
-        run: |
-          kubectl set image deployment/your-app-deployment \
-            app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-          kubectl rollout status deployment/your-app-deployment --timeout=120s
+        # 4) Make the URI available to later steps / Terraform
+        echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
 
-      - name: Setup Python 3.10
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+    # ─────────────────────  upload model artefact  ────────────────────────
+    - name: Upload model tarball to S3
+      run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
-      - name: Install Python dependencies
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
+    # ─────────────────────────  deploy to EKS  ────────────────────────────
+    - name: Deploy APP to EKS
+      run: |
+        kubectl set image deployment/your-app-deployment \
+          app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+        kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-      - name: Predict failure probability
-        id: predict
-        run: |
-          echo '{"cpu_usage":85.0,"memory_usage":70.0,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
-          prob=$(python ml_model/predict_failure.py --input-json metrics.json)
-          echo "fail_prob=$prob" >> $GITHUB_ENV
-          echo "Predicted fail_prob: $prob"
+    # ────────────────────  run prediction & auto-heal  ─────────────────────
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
 
-      - name: Auto-heal if needed
-        if: ${{ env.fail_prob && env.fail_prob >= '0.75' }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python pipeline/scripts/smart_auto_heal.py \
-            --deployment your-app-deployment \
-            --namespace default \
-            --replicas 3
-          curl -X POST -H "Content-Type: application/json" \
-            --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${{ env.fail_prob }}).\"}" \
-            $SLACK_WEBHOOK_URL
+    - name: Install Python deps if present
+      run: |
+        if [ -f requirements.txt ]; then
+          pip install --upgrade pip
+          pip install -r requirements.txt
+        fi
+
+    - name: Predict failure probability
+      id: predict
+      run: |
+        echo '{"cpu_usage":85,"memory_usage":70,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
+        prob=$(python ml_model/predict_failure.py --input-json metrics.json)
+        echo "fail_prob=$prob" >> $GITHUB_ENV
+        echo "Predicted fail_prob: $prob"
+
+    - name: Auto-heal if needed
+      if: ${{ env.fail_prob && env.fail_prob >= '0.75' }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        python pipeline/scripts/smart_auto_heal.py \
+          --deployment your-app-deployment \
+          --namespace default \
+          --replicas 3
+        curl -X POST -H "Content-Type: application/json" \
+          --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${{ env.fail_prob }}).\"}" \
+          "$SLACK_WEBHOOK_URL"

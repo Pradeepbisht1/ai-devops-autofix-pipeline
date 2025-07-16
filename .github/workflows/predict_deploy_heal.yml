@@ -11,10 +11,10 @@ permissions:
   contents: read
 
 env:
-  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}   # ap-southeast-2
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:            ${{ secrets.ECR_REPO }}
-  MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}
+  ECR_REPO:            ${{ secrets.ECR_REPO }}             # app image repo
+  MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}       # e.g. sklearn-inference
   IMAGE_TAG:           "1.2-1-cpu-py3"
   MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}
 
@@ -24,8 +24,7 @@ jobs:
 
     steps:
     # ──────────────────────────  checkout & creds  ──────────────────────────
-    - name: Checkout repo
-      uses: actions/checkout@v3
+    - uses: actions/checkout@v3
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
@@ -39,7 +38,7 @@ jobs:
     # ─────────────────────────────  tooling  ───────────────────────────────
     - name: Install AWS CLI v2
       run: |
-        if ! aws --version > /dev/null 2>&1; then
+        if ! aws --version >/dev/null 2>&1; then
           curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
           unzip -q awscliv2.zip
           sudo ./aws/install --update
@@ -61,7 +60,7 @@ jobs:
     - name: Verify Kubernetes access
       run: kubectl get nodes
 
-    # ──────────────────────  build & push app image  ───────────────────────
+    # ──────────────────────  build & push APP image  ───────────────────────
     - name: Build & push APP image to ECR
       run: |
         docker build -t $ECR_REPO:${{ github.sha }} app
@@ -75,51 +74,52 @@ jobs:
         docker push \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    # ──────────────────  mirror SageMaker DLC → private ECR  ───────────────
+    # ───────────── mirror SageMaker DLC → *your* private ECR ───────────────
     - name: Mirror SageMaker scikit-learn DLC to private ECR
+      env:
+        SRC_ACCOUNT:  "257758044811"                       # DLC account for ap-southeast-2
+        REGION:       ${{ env.AWS_DEFAULT_REGION }}        # ap-southeast-2
+        TAG:          ${{ env.IMAGE_TAG }}
+        DST_REPO:     ${{ env.MODEL_ECR_REPO }}
       run: |
-        # Private ECR URI
-        REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$MODEL_ECR_REPO"
-        TAG="$IMAGE_TAG"
-        PUBLIC_REPO="public.ecr.aws/sagemaker/sagemaker-scikit-learn"
+        SRC_URI="$SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/sagemaker-scikit-learn:$TAG"
+        DST_URI="$AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$DST_REPO:$TAG"
 
-        # 0) Authenticate to public ECR (avoid anonymous rate-limits)
-        aws ecr-public get-login-password --region us-east-1 \
-          | docker login --username AWS --password-stdin public.ecr.aws
-
-        # 1) Pull the official image
-        docker pull $PUBLIC_REPO:$TAG
-
-        # 2) Tag into your private ECR namespace
-        docker tag $PUBLIC_REPO:$TAG $REPO_URI:$TAG
-
-        # 3) Login & push to private ECR
-        aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+        # 1) Login to the AWS DLC registry for *this* region
+        aws ecr get-login-password --region $REGION \
           | docker login --username AWS --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-        docker push $REPO_URI:$TAG
+            $SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
 
-        # 4) Make the URI available to later steps / Terraform
-        echo "MODEL_IMAGE_URI=$REPO_URI:$TAG" >> $GITHUB_ENV
+        # 2) Pull & re-tag
+        docker pull $SRC_URI
+        docker tag  $SRC_URI  $DST_URI
 
-    # ─────────────────────  upload model artefact  ────────────────────────
+        # 3) Login to *your* ECR and push
+        aws ecr get-login-password --region $REGION \
+          | docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+        docker push $DST_URI
+
+        # 4) Surface for Terraform / SageMaker
+        echo "MODEL_IMAGE_URI=$DST_URI" >> $GITHUB_ENV
+
+    # ───────────────────── upload model artefact ──────────────────────────
     - name: Upload model tarball to S3
       run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
-    # ─────────────────────────  deploy to EKS  ────────────────────────────
+    # ───────────────────────── deploy to EKS ──────────────────────────────
     - name: Deploy APP to EKS
       run: |
         kubectl set image deployment/your-app-deployment \
           app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-    # ────────────────────  run prediction & auto-heal  ─────────────────────
-    - name: Setup Python 3.10
-      uses: actions/setup-python@v4
+    # ─────────────────── run prediction & auto-heal ───────────────────────
+    - uses: actions/setup-python@v4
       with:
         python-version: "3.10"
 
-    - name: Install Python deps if present
+    - name: Install Python deps (if any)
       run: |
         if [ -f requirements.txt ]; then
           pip install --upgrade pip

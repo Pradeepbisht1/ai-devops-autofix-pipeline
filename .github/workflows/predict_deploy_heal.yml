@@ -3,27 +3,25 @@ name: Predict, Deploy & Auto-Heal Pipeline
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "*"
+    branches: [ "*" ]
 
 permissions:
-  id-token: write
+  id-token: write       # OIDC to assume the IAM role
   contents: read
 
 env:
   AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}   # ap-southeast-2
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:            ${{ secrets.ECR_REPO }}             # app image repo
+  ECR_REPO:            ${{ secrets.ECR_REPO }}             # app repo
   MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}       # e.g. sklearn-inference
-  IMAGE_TAG:           "1.2-1-cpu-py3"
+  IMAGE_TAG:           "1.2-1-cpu-py3"                     # SageMaker DLC tag
   MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
-
     steps:
-    # ──────────────────────────  checkout & creds  ──────────────────────────
+    # ──────────────── checkout & AWS creds ────────────────
     - uses: actions/checkout@v3
 
     - name: Configure AWS credentials
@@ -32,23 +30,23 @@ jobs:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
         aws-region:     ${{ env.AWS_DEFAULT_REGION }}
 
-    - name: Show caller identity
-      run: aws sts get-caller-identity
+    - run: aws sts get-caller-identity
+      name: Show caller identity
 
-    # ─────────────────────────────  tooling  ───────────────────────────────
-    - name: Install AWS CLI v2
+    # ─────────────── tools (awscli, kubectl) ──────────────
+    - name: Install AWS CLI v2 (if missing)
       run: |
-        if ! aws --version >/dev/null 2>&1; then
+        if ! command -v aws >/dev/null 2>&1; then
           curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
           unzip -q awscliv2.zip
-          sudo ./aws/install --update
+          sudo ./aws/install
         fi
         aws --version
 
     - name: Install kubectl
       run: |
-        K8S_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-        curl -sL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+        K8S_VERSION=$(curl -sSL https://dl.k8s.io/release/stable.txt)
+        curl -sSL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
         chmod +x kubectl && sudo mv kubectl /usr/local/bin/
 
     - name: Configure kubectl for EKS
@@ -57,11 +55,11 @@ jobs:
           --region $AWS_DEFAULT_REGION \
           --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
-    - name: Verify Kubernetes access
-      run: kubectl get nodes
+    - run: kubectl get nodes
+      name: Verify Kubernetes access
 
-    # ──────────────────────  build & push APP image  ───────────────────────
-    - name: Build & push APP image to ECR
+    # ───────────── build & push **APP** image ─────────────
+    - name: Build & push APP image
       run: |
         docker build -t $ECR_REPO:${{ github.sha }} app
         docker tag  $ECR_REPO:${{ github.sha }} \
@@ -74,18 +72,19 @@ jobs:
         docker push \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    # ───────────── mirror SageMaker DLC → *your* private ECR ───────────────
-    - name: Mirror SageMaker scikit-learn DLC to private ECR
+    # ───── mirror SageMaker **sklearn-inference** DLC image ─────
+    - name: Mirror SageMaker scikit-learn DLC → private ECR
       env:
-        SRC_ACCOUNT:  "257758044811"                       # DLC account for ap-southeast-2
-        REGION:       ${{ env.AWS_DEFAULT_REGION }}        # ap-southeast-2
-        TAG:          ${{ env.IMAGE_TAG }}
-        DST_REPO:     ${{ env.MODEL_ECR_REPO }}
+        SRC_ACCOUNT: "246618743249"               # ✅ DLC account for ap-southeast-2
+        REGION:      ${{ env.AWS_DEFAULT_REGION }}
+        SRC_REPO:    "sklearn-inference"
+        TAG:         ${{ env.IMAGE_TAG }}
+        DST_REPO:    ${{ env.MODEL_ECR_REPO }}
       run: |
-        SRC_URI="$SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/sagemaker-scikit-learn:$TAG"
+        SRC_URI="$SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$SRC_REPO:$TAG"
         DST_URI="$AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$DST_REPO:$TAG"
 
-        # 1) Login to the AWS DLC registry for *this* region
+        # 1) Login to SageMaker DLC registry (source)
         aws ecr get-login-password --region $REGION \
           | docker login --username AWS --password-stdin \
             $SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
@@ -94,36 +93,34 @@ jobs:
         docker pull $SRC_URI
         docker tag  $SRC_URI  $DST_URI
 
-        # 3) Login to *your* ECR and push
+        # 3) Login to **your** ECR & push
         aws ecr get-login-password --region $REGION \
           | docker login --username AWS --password-stdin \
             $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
         docker push $DST_URI
 
-        # 4) Surface for Terraform / SageMaker
+        # 4) Expose URI for Terraform / SageMaker
         echo "MODEL_IMAGE_URI=$DST_URI" >> $GITHUB_ENV
 
-    # ───────────────────── upload model artefact ──────────────────────────
+    # ───────────── upload model artefact ─────────────
     - name: Upload model tarball to S3
       run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
-    # ───────────────────────── deploy to EKS ──────────────────────────────
+    # ───────────── deploy APP to EKS ────────────────
     - name: Deploy APP to EKS
       run: |
         kubectl set image deployment/your-app-deployment \
           app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-    # ─────────────────── run prediction & auto-heal ───────────────────────
+    # ─────────── prediction + auto-heal ─────────────
     - uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
+      with: { python-version: "3.10" }
 
     - name: Install Python deps (if any)
       run: |
         if [ -f requirements.txt ]; then
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --upgrade pip && pip install -r requirements.txt
         fi
 
     - name: Predict failure probability

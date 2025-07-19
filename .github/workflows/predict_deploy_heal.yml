@@ -20,17 +20,14 @@ env:
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
-
-    env:            # cluster‑specific values (secrets)
-      EKS_NS:   ${{ secrets.EKS_NAMESPACE }}          # may be empty → default later
+    env:
+      EKS_NS:   ${{ secrets.EKS_NAMESPACE }}      # blank ⇒ default
       DEPLOY:   ${{ secrets.EKS_DEPLOYMENT_NAME }}
       CTR:      ${{ secrets.EKS_CONTAINER_NAME }}
 
     steps:
-    # ── checkout ───────────────────────────────────────────────
     - uses: actions/checkout@v3
 
-    # ── AWS creds via OIDC ─────────────────────────────────────
     - uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -39,34 +36,26 @@ jobs:
     - name: Who am I?
       run: aws sts get-caller-identity
 
-    # ── Ensure ECR repos exist ────────────────────────────────
-    - name: Create ECR repos if missing
+    - name: Ensure ECR repos exist
       run: |
         for repo in "$ECR_REPO" sklearn-inference ; do
           aws ecr describe-repositories --repository-names "$repo" \
             || aws ecr create-repository --repository-name "$repo"
         done
 
-    # ── Build & push APP image ────────────────────────────────
     - name: Build & push APP image
       env: { DOCKER_BUILDKIT: 0 }
       run: |
         docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
-        docker tag  $ECR_REPO:${{ github.sha }} \
+        docker tag $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-
         aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          docker login -u AWS --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-        docker push \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-
-    # ── Upload model artefact ─────────────────────────────────
     - name: Upload model.tar.gz to S3
       run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
-    # ── kubectl setup ─────────────────────────────────────────
     - name: Install kubectl
       run: |
         curl -sSL https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
@@ -74,21 +63,16 @@ jobs:
 
     - name: Configure kubeconfig
       run: |
-        aws eks update-kubeconfig \
-          --region $AWS_DEFAULT_REGION \
-          --name   ${{ secrets.EKS_CLUSTER_NAME }}
+        aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name ${{ secrets.EKS_CLUSTER_NAME }}
         kubectl get nodes
 
-    # ── Bootstrap namespace + skeleton deployment (if missing) ─
-    - name: Bootstrap k8s objects (runs only if missing)
+    - name: Bootstrap k8s objects (if missing)
       run: |
         set -e
         NS="${EKS_NS:-default}"
-
         if ! kubectl get ns "$NS" >/dev/null 2>&1 ; then
           kubectl create ns "$NS"
         fi
-
         if ! kubectl get deploy "$DEPLOY" -n "$NS" >/dev/null 2>&1 ; then
           cat <<EOF | kubectl apply -n "$NS" -f -
           apiVersion: apps/v1
@@ -103,21 +87,18 @@ jobs:
                 containers:
                   - name: $CTR
                     image: busybox
-                    command: ["sh","-c","while true; do echo bootstrap; sleep 3600; done"]
+                    command: ["sh","-c","while true; do sleep 3600; done"]
           EOF
         fi
 
-    # ── Rollout new image ─────────────────────────────────────
     - name: Rollout new image
       env:
         IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
       run: |
         NS="${EKS_NS:-default}"
-        echo "Updating $NS/$DEPLOY → $IMAGE_URI"
         kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
         kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
 
-    # ── Python env for predict + heal ─────────────────────────
     - uses: actions/setup-python@v4
       with: { python-version: '3.10' }
 
@@ -125,23 +106,18 @@ jobs:
       if: ${{ hashFiles('requirements.txt') != '' }}
       run: pip install -r requirements.txt
 
-    # ── Predict failure probability ───────────────────────────
     - name: Predict failure probability
       id: predict
       run: |
-        prob=$(python ml_model/predict_failure.py \
-          --input-json '{"cpu":85,"memory":70,"errors":1}')
+        prob=$(python ml_model/predict_failure.py --input-json '{"cpu":85,"memory":70,"errors":1}')
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-        echo "Predicted fail_prob=$prob"
 
-    # ── Auto‑heal (conditional) ───────────────────────────────
     - name: Auto‑heal if prob ≥ 0.75
-      if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
+      if: '${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}'
       env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
       run: |
         NS="${EKS_NS:-default}"
-        python pipeline/scripts/smart_auto_heal.py \
-          --deployment $DEPLOY --namespace $NS --replicas 3
-        curl -X POST -H "Content-Type: application/json" \
-          --data "{\"text\":\"🚑 Auto‑heal triggered (fail_prob=${{ steps.predict.outputs.fail_prob }}).\"}" \
-          "$SLACK_WEBHOOK_URL"
+        python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
+        curl -X POST -H 'Content-Type: application/json' \
+             --data '{"text":"🚑 Auto‑heal triggered (fail_prob='${{ steps.predict.outputs.fail_prob }}')."}' \
+             "$SLACK_WEBHOOK_URL"

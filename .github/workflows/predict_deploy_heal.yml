@@ -2,12 +2,9 @@ name: Predict, Deploy & Auto‑Heal Pipeline
 
 on:
   workflow_dispatch:
-  push:
-    branches: ['*']
+  push: { branches: ['*'] }
 
-permissions:
-  id-token: write
-  contents: read
+permissions: { id-token: write, contents: read }
 
 env:
   AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
@@ -21,9 +18,9 @@ jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
     env:
-      EKS_NS:   ${{ secrets.EKS_NAMESPACE }}      # blank ⇒ default
-      DEPLOY:   ${{ secrets.EKS_DEPLOYMENT_NAME }}
-      CTR:      ${{ secrets.EKS_CONTAINER_NAME }}
+      NS:      ${{ secrets.EKS_NAMESPACE || 'prod' }}
+      DEPLOY:  ${{ secrets.EKS_DEPLOYMENT_NAME  || 'my-api-deployment' }}
+      CTR:     ${{ secrets.EKS_CONTAINER_NAME   || 'api-container' }}
 
     steps:
     - uses: actions/checkout@v3
@@ -33,10 +30,10 @@ jobs:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
         aws-region:     ${{ env.AWS_DEFAULT_REGION }}
 
-    - name: Who am I?
-      run: aws sts get-caller-identity
+    - run: aws sts get-caller-identity
+      name: Who am I?
 
-    - name: Ensure ECR repos exist
+    - name: Ensure ECR repos
       run: |
         for repo in "$ECR_REPO" sklearn-inference ; do
           aws ecr describe-repositories --repository-names "$repo" \
@@ -47,13 +44,13 @@ jobs:
       env: { DOCKER_BUILDKIT: 0 }
       run: |
         docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
-        docker tag $ECR_REPO:${{ github.sha }} \
+        docker tag  $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
           docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
         docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    - name: Upload model.tar.gz to S3
+    - name: Upload model artefact
       run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
     - name: Install kubectl
@@ -66,36 +63,14 @@ jobs:
         aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name ${{ secrets.EKS_CLUSTER_NAME }}
         kubectl get nodes
 
-    - name: Bootstrap k8s objects (if missing)
+    - name: Bootstrap objects once
       run: |
-        set -e
-        NS="${EKS_NS:-default}"
-        if ! kubectl get ns "$NS" >/dev/null 2>&1 ; then
-          kubectl create ns "$NS"
-        fi
-        if ! kubectl get deploy "$DEPLOY" -n "$NS" >/dev/null 2>&1 ; then
-          cat <<EOF | kubectl apply -n "$NS" -f -
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: $DEPLOY }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: $DEPLOY } }
-            template:
-              metadata: { labels: { app: $DEPLOY } }
-              spec:
-                containers:
-                  - name: $CTR
-                    image: busybox
-                    command: ["sh","-c","while true; do sleep 3600; done"]
-          EOF
-        fi
+        kubectl apply -f kubernetes/bootstrap.yaml || true
 
     - name: Rollout new image
       env:
         IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
       run: |
-        NS="${EKS_NS:-default}"
         kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
         kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
 
@@ -103,7 +78,7 @@ jobs:
       with: { python-version: '3.10' }
 
     - name: Install Python deps
-      if: ${{ hashFiles('requirements.txt') != '' }}
+      if: ${{ hashFiles('requirements.txt') }}
       run: pip install -r requirements.txt
 
     - name: Predict failure probability
@@ -112,12 +87,11 @@ jobs:
         prob=$(python ml_model/predict_failure.py --input-json '{"cpu":85,"memory":70,"errors":1}')
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
 
-    - name: Auto‑heal if prob ≥ 0.75
-      if: '${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}'
+    - name: Auto‑heal if prob ≥ 0.75
+      if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
       env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
       run: |
-        NS="${EKS_NS:-default}"
         python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
         curl -X POST -H 'Content-Type: application/json' \
-             --data '{"text":"🚑 Auto‑heal triggered (fail_prob='${{ steps.predict.outputs.fail_prob }}')."}' \
+             --data '{"text":"🚑 Auto‑heal triggered (fail_prob=${{ steps.predict.outputs.fail_prob }})."}' \
              "$SLACK_WEBHOOK_URL"

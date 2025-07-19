@@ -31,3 +31,5 @@ __pycache__/
 # VSCode / env files (optional)
 .vscode/
 .env
+terraform/**/.terraform/
+terraform/**/terraform.tfstate*

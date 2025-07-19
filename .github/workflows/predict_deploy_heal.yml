@@ -39,8 +39,8 @@ jobs:
     - name: Ensure ECR repos
       run: |
         for repo in "$ECR_REPO" sklearn-inference ; do
-          aws ecr describe-repositories --repository-names "$repo" \
-            || aws ecr create-repository --repository-name "$repo"
+          aws ecr describe-repositories --repository-names "$repo" ||
+          aws ecr create-repository --repository-name "$repo"
         done
 
     - name: Build & push APP image
@@ -67,8 +67,7 @@ jobs:
         kubectl get nodes
 
     - name: Bootstrap objects once
-      run: |
-        kubectl apply -f kubernetes/bootstrap.yaml || true
+      run: kubectl apply -f kubernetes/bootstrap.yaml || true
 
     - name: Rollout new image
       env:
@@ -84,14 +83,14 @@ jobs:
       if: "${{ hashFiles('requirements.txt') != '' }}"
       run: pip install -r requirements.txt
 
-    # ---------- FIXED STEP (correct feature names) ----------
+    # ---------- Predict step (numeric output via --plain) ----------
     - name: Predict failure probability
       id: predict
       run: |
-        prob=$(python ml_model/predict_failure.py --input-json \
+        prob=$(python ml_model/predict_failure.py --plain --input-json \
           '{"build_time":250,"error_count":7,"cpu_usage":60,"test_pass_rate":0.70}')
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # --------------------------------------------------------
+    # ----------------------------------------------------------------
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
@@ -99,5 +98,5 @@ jobs:
       run: |
         python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
         curl -X POST -H 'Content-Type: application/json' \
-             --data '{"text":"🚑 Auto‑heal triggered (fail_prob='${{ steps.predict.outputs.fail_prob }}')."}' \
+             --data "{\"text\":\"🚑 Auto‑heal triggered (fail_prob=${{ steps.predict.outputs.fail_prob }}).\"}" \
              "$SLACK_WEBHOOK_URL"

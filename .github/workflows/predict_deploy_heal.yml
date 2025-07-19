@@ -2,36 +2,39 @@ name: Predict, Deploy & Auto‑Heal Pipeline
 
 on:
   workflow_dispatch:
-  push: { branches: ['*'] }
+  push:
+    branches: ['*']
 
-permissions: { id-token: write, contents: read }
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
-  AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:            ${{ secrets.ECR_REPO }}
+  AWS_DEFAULT_REGION:  "${{ secrets.AWS_DEFAULT_REGION }}"
+  AWS_ACCOUNT_ID:      "${{ secrets.AWS_ACCOUNT_ID }}"
+  ECR_REPO:            "${{ secrets.ECR_REPO }}"
   IMAGE_TAG:           "1.2-1-cpu-py3"
   MODEL_IMAGE_URI:     "709825985650.dkr.ecr.ap-southeast-2.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
-  MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}
+  MODEL_S3_PATH:       "${{ secrets.MODEL_S3_PATH }}"
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
     env:
-      NS:      ${{ secrets.EKS_NAMESPACE || 'prod' }}
-      DEPLOY:  ${{ secrets.EKS_DEPLOYMENT_NAME  || 'my-api-deployment' }}
-      CTR:     ${{ secrets.EKS_CONTAINER_NAME   || 'api-container' }}
+      NS:     "${{ secrets.EKS_NAMESPACE        || 'prod' }}"
+      DEPLOY: "${{ secrets.EKS_DEPLOYMENT_NAME  || 'my-api-deployment' }}"
+      CTR:    "${{ secrets.EKS_CONTAINER_NAME   || 'api-container' }}"
 
     steps:
     - uses: actions/checkout@v3
 
     - uses: aws-actions/configure-aws-credentials@v2
       with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region:     ${{ env.AWS_DEFAULT_REGION }}
+        role-to-assume: "${{ secrets.AWS_ROLE_ARN }}"
+        aws-region:     "${{ env.AWS_DEFAULT_REGION }}"
 
-    - run: aws sts get-caller-identity
-      name: Who am I?
+    - name: Who am I?
+      run: aws sts get-caller-identity
 
     - name: Ensure ECR repos
       run: |
@@ -60,7 +63,7 @@ jobs:
 
     - name: Configure kubeconfig
       run: |
-        aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name ${{ secrets.EKS_CLUSTER_NAME }}
+        aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name "${{ secrets.EKS_CLUSTER_NAME }}"
         kubectl get nodes
 
     - name: Bootstrap objects once
@@ -78,7 +81,7 @@ jobs:
       with: { python-version: '3.10' }
 
     - name: Install Python deps
-      if: ${{ hashFiles('requirements.txt') }}
+      if: "${{ hashFiles('requirements.txt') != '' }}"
       run: pip install -r requirements.txt
 
     - name: Predict failure probability
@@ -88,10 +91,10 @@ jobs:
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
 
     - name: Auto‑heal if prob ≥ 0.75
-      if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
-      env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
+      if: "${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
+      env: { SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}" }
       run: |
         python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
         curl -X POST -H 'Content-Type: application/json' \
-             --data '{"text":"🚑 Auto‑heal triggered (fail_prob=${{ steps.predict.outputs.fail_prob }})."}' \
+             --data '{"text":"🚑 Auto‑heal triggered (fail_prob='${{ steps.predict.outputs.fail_prob }}')."}' \
              "$SLACK_WEBHOOK_URL"

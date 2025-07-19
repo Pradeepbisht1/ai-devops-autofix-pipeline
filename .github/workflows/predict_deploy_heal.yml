@@ -84,11 +84,14 @@ jobs:
       if: "${{ hashFiles('requirements.txt') != '' }}"
       run: pip install -r requirements.txt
 
+    # ---------- FIXED STEP (correct feature names) ----------
     - name: Predict failure probability
       id: predict
       run: |
-        prob=$(python ml_model/predict_failure.py --input-json '{"cpu":85,"memory":70,"errors":1}')
+        prob=$(python ml_model/predict_failure.py --input-json \
+          '{"build_time":250,"error_count":7,"cpu_usage":60,"test_pass_rate":0.70}')
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+    # --------------------------------------------------------
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"

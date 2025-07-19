@@ -5,3 +5,12 @@ __pycache__/
 .env
 .vscode/
 .idea/
+# ─── Terraform ───────────────────────────────────────────
+terraform/.terraform/        # provider cache
+terraform/*.tfstate*         # state files & backups
+terraform/*.tfvars           # personal or env‑specific vars
+terraform/*.auto.tfvars      # auto‑loaded var files
+terraform/crash.log          # crash logs
+terraform/*-override.tf*     # local overrides
+*.tfplan                      # plan output files
+*.pem *.key *.crt            # any keys/certs lying around

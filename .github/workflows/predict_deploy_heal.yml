@@ -1,67 +1,120 @@
-name: Predict, Deploy & Auto‑Heal
+name: Predict, Deploy & Auto‑Heal Pipeline
 
-on: [workflow_dispatch, push]
+on:
+  workflow_dispatch:
+  push:
+    branches: ['*']        # koi bhi branch push par chale
+
+permissions:
+  id-token: write          # OIDC role‑assume
+  contents: read
 
 env:
-  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}           # ap-southeast-2
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:            ${{ secrets.ECR_REPO }}
+  ECR_REPO:            ${{ secrets.ECR_REPO }}                     # app-repo
   IMAGE_TAG:           "1.2-1-cpu-py3"
+  # ⬇️ public SageMaker scikit‑learn DLC image (no private mirror needed)
   MODEL_IMAGE_URI:     "709825985650.dkr.ecr.ap-southeast-2.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
+  MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}                # s3://.../model.tar.gz
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v3
-    - uses: aws-actions/configure-aws-credentials@v2
+    # ── checkout ────────────────────────────────────────────────
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    # ── AWS creds via OIDC ──────────────────────────────────────
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_DEFAULT_REGION }}
+        aws-region:     ${{ env.AWS_DEFAULT_REGION }}
 
-    - name: Ensure ECR repos exist
+    - name: Who am I?
+      run: aws sts get-caller-identity
+
+    # ── Ensure ECR repos exist (idempotent) ─────────────────────
+    - name: Create ECR repos if missing
       run: |
-        for repo in $ECR_REPO sklearn-inference ; do
-          aws ecr describe-repositories --repository-names $repo \
-            || aws ecr create-repository --repository-name $repo
+        for repo in "$ECR_REPO" sklearn-inference; do
+          aws ecr describe-repositories --repository-names "$repo" \
+            || aws ecr create-repository --repository-name "$repo"
         done
 
+    # ── Build & push **APP** image (schema2 manifest) ───────────
     - name: Build & push APP image
-      env: { DOCKER_BUILDKIT: 0 }
+      env: { DOCKER_BUILDKIT: 0 }   # avoid OCI index
       run: |
-        docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} app
-        docker tag $ECR_REPO:${{ github.sha }} \
+        docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
+        docker tag  $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+
         aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+          docker login -u AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
-    # mirror step removed – using public DLC URI
+        docker push \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    - name: Upload model artefact
-      run: aws s3 cp ml_model/models/model.tar.gz ${{ secrets.MODEL_S3_PATH }}
+    # ── Upload model artefact to S3 ─────────────────────────────
+    - name: Upload model.tar.gz to S3
+      run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
 
-    - name: Deploy APP to EKS
+    # ── kubectl setup & deploy to EKS ───────────────────────────
+    - name: Install kubectl
       run: |
-        kubectl set image deployment/your-app-deployment \
-          app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-        kubectl rollout status deployment/your-app-deployment --timeout=120s
+        ver=$(curl -sSL https://dl.k8s.io/release/stable.txt)
+        curl -sSL "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl" -o kubectl
+        chmod +x kubectl && sudo mv kubectl /usr/local/bin
 
+    - name: Configure kubectl for EKS
+      run: |
+        aws eks update-kubeconfig \
+          --region $AWS_DEFAULT_REGION \
+          --name   ${{ secrets.EKS_CLUSTER_NAME }}
+
+    - name: Deploy latest image to EKS
+      env:
+        IMAGE_URI: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+      run: |
+        kubectl set image deployment/${{ secrets.EKS_DEPLOYMENT_NAME }} \
+          ${{ secrets.EKS_CONTAINER_NAME }}=$IMAGE_URI
+        kubectl rollout status deployment/${{ secrets.EKS_DEPLOYMENT_NAME }} --timeout=180s
+
+    # ── Python env for prediction & heal logic ─────────────────
     - uses: actions/setup-python@v4
       with: { python-version: '3.10' }
 
+    - name: Install Python deps (if any)
+      run: |
+        if [ -f requirements.txt ]; then
+          pip install --upgrade pip
+          pip install -r requirements.txt
+        fi
+
+    # ── Predict failure probability ────────────────────────────
     - name: Predict failure probability
       id: predict
       run: |
-        prob=$(python ml_model/predict_failure.py --input-json '{"cpu":80}')
+        prob=$(python ml_model/predict_failure.py \
+          --input-json '{"cpu":85,"memory":70,"errors":1}')
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+        echo "Predicted fail_prob=$prob"
 
-    - name: Auto-heal if needed
+    # ── Auto‑heal (conditional) ────────────────────────────────
+    - name: Auto‑heal if prob ≥ 0.75
       if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
-      env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       run: |
         python pipeline/scripts/smart_auto_heal.py \
-          --deployment your-app-deployment --namespace default --replicas 3
+          --deployment ${{ secrets.EKS_DEPLOYMENT_NAME }} \
+          --namespace  default \
+          --replicas   3
         curl -X POST -H "Content-Type: application/json" \
-          --data "{\"text\":\"Auto‑heal done (fail_prob=${{ steps.predict.outputs.fail_prob }}).\"}" \
+          --data "{\"text\":\"🚑 Auto‑heal triggered ‑ fail_prob=${{ steps.predict.outputs.fail_prob }}.\"}" \
           "$SLACK_WEBHOOK_URL"

@@ -1,145 +1,67 @@
-name: Predict, Deploy & Auto-Heal Pipeline
+name: Predict, Deploy & Auto‑Heal
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [ "*" ]
-
-permissions:
-  id-token: write       # OIDC to assume the IAM role
-  contents: read
+on: [workflow_dispatch, push]
 
 env:
-  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}   # ap-southeast-2
+  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPO:            ${{ secrets.ECR_REPO }}             # app repo
-  MODEL_ECR_REPO:      ${{ secrets.MODEL_ECR_REPO }}       # e.g. sklearn-inference
-  IMAGE_TAG:           "1.2-1-cpu-py3"                     # SageMaker DLC tag
-  MODEL_S3_PATH:       ${{ secrets.MODEL_S3_PATH }}
+  ECR_REPO:            ${{ secrets.ECR_REPO }}
+  IMAGE_TAG:           "1.2-1-cpu-py3"
+  MODEL_IMAGE_URI:     "709825985650.dkr.ecr.ap-southeast-2.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
     steps:
-    # ──────────────── checkout & AWS creds ────────────────
     - uses: actions/checkout@v3
-
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
+    - uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region:     ${{ env.AWS_DEFAULT_REGION }}
+        aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
-    - run: aws sts get-caller-identity
-      name: Show caller identity
-
-    # ─────────────── tools (awscli, kubectl) ──────────────
-    - name: Install AWS CLI v2 (if missing)
+    - name: Ensure ECR repos exist
       run: |
-        if ! command -v aws >/dev/null 2>&1; then
-          curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
-          unzip -q awscliv2.zip
-          sudo ./aws/install
-        fi
-        aws --version
+        for repo in $ECR_REPO sklearn-inference ; do
+          aws ecr describe-repositories --repository-names $repo \
+            || aws ecr create-repository --repository-name $repo
+        done
 
-    - name: Install kubectl
-      run: |
-        K8S_VERSION=$(curl -sSL https://dl.k8s.io/release/stable.txt)
-        curl -sSL "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" -o kubectl
-        chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-
-    - name: Configure kubectl for EKS
-      run: |
-        aws eks update-kubeconfig \
-          --region $AWS_DEFAULT_REGION \
-          --name   ${{ secrets.EKS_CLUSTER_NAME }}
-
-    - run: kubectl get nodes
-      name: Verify Kubernetes access
-
-    # ───────────── build & push **APP** image ─────────────
     - name: Build & push APP image
+      env: { DOCKER_BUILDKIT: 0 }
       run: |
-        docker build -t $ECR_REPO:${{ github.sha }} app
-        docker tag  $ECR_REPO:${{ github.sha }} \
+        docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} app
+        docker tag $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+          docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-        aws ecr get-login-password --region $AWS_DEFAULT_REGION \
-          | docker login --username AWS --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+    # mirror step removed – using public DLC URI
 
-        docker push \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+    - name: Upload model artefact
+      run: aws s3 cp ml_model/models/model.tar.gz ${{ secrets.MODEL_S3_PATH }}
 
-    # ───── mirror SageMaker **sklearn-inference** DLC image ─────
-    - name: Mirror SageMaker scikit-learn DLC → private ECR
-      env:
-        SRC_ACCOUNT: "246618743249"               # ✅ DLC account for ap-southeast-2
-        REGION:      ${{ env.AWS_DEFAULT_REGION }}
-        SRC_REPO:    "sklearn-inference"
-        TAG:         ${{ env.IMAGE_TAG }}
-        DST_REPO:    ${{ env.MODEL_ECR_REPO }}
-      run: |
-        SRC_URI="$SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$SRC_REPO:$TAG"
-        DST_URI="$AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$DST_REPO:$TAG"
-
-        # 1) Login to SageMaker DLC registry (source)
-        aws ecr get-login-password --region $REGION \
-          | docker login --username AWS --password-stdin \
-            $SRC_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
-
-        # 2) Pull & re-tag
-        docker pull $SRC_URI
-        docker tag  $SRC_URI  $DST_URI
-
-        # 3) Login to **your** ECR & push
-        aws ecr get-login-password --region $REGION \
-          | docker login --username AWS --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-        docker push $DST_URI
-
-        # 4) Expose URI for Terraform / SageMaker
-        echo "MODEL_IMAGE_URI=$DST_URI" >> $GITHUB_ENV
-
-    # ───────────── upload model artefact ─────────────
-    - name: Upload model tarball to S3
-      run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
-
-    # ───────────── deploy APP to EKS ────────────────
     - name: Deploy APP to EKS
       run: |
         kubectl set image deployment/your-app-deployment \
           app-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         kubectl rollout status deployment/your-app-deployment --timeout=120s
 
-    # ─────────── prediction + auto-heal ─────────────
     - uses: actions/setup-python@v4
-      with: { python-version: "3.10" }
-
-    - name: Install Python deps (if any)
-      run: |
-        if [ -f requirements.txt ]; then
-          pip install --upgrade pip && pip install -r requirements.txt
-        fi
+      with: { python-version: '3.10' }
 
     - name: Predict failure probability
       id: predict
       run: |
-        echo '{"cpu_usage":85,"memory_usage":70,"error_count":1,"test_passed":true,"build_time":90}' > metrics.json
-        prob=$(python ml_model/predict_failure.py --input-json metrics.json)
-        echo "fail_prob=$prob" >> $GITHUB_ENV
-        echo "Predicted fail_prob: $prob"
+        prob=$(python ml_model/predict_failure.py --input-json '{"cpu":80}')
+        echo "fail_prob=$prob" >> $GITHUB_OUTPUT
 
     - name: Auto-heal if needed
-      if: ${{ env.fail_prob && env.fail_prob >= '0.75' }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: ${{ fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}
+      env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
       run: |
         python pipeline/scripts/smart_auto_heal.py \
-          --deployment your-app-deployment \
-          --namespace default \
-          --replicas 3
+          --deployment your-app-deployment --namespace default --replicas 3
         curl -X POST -H "Content-Type: application/json" \
-          --data "{\"text\":\"Auto-heal triggered: scaled to 3 replicas (fail_prob=${{ env.fail_prob }}).\"}" \
+          --data "{\"text\":\"Auto‑heal done (fail_prob=${{ steps.predict.outputs.fail_prob }}).\"}" \
           "$SLACK_WEBHOOK_URL"

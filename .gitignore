@@ -14,3 +14,20 @@ terraform/crash.log          # crash logs
 terraform/*-override.tf*     # local overrides
 *.tfplan                      # plan output files
 *.pem *.key *.crt            # any keys/certs lying around
+# ─── Extra ignores we missed ───────────────────────────
+# Docker build artefacts
+docker/
+*.tar
+
+# ML model binaries & temp images
+ml_model/*.pkl
+ml_model/*.tar
+ml_model/image.tar
+
+# Python noise
+__pycache__/
+*.py[cod]
+
+# VSCode / env files (optional)
+.vscode/
+.env

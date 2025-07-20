@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  AWS_DEFAULT_REGION:  "${{ secrets.AWS_DEFAULT_REGION }}"
+  AWS_DEFAULT_REGION: "${{ secrets.AWS_DEFAULT_REGION }}"
   AWS_ACCOUNT_ID:     "${{ secrets.AWS_ACCOUNT_ID }}"
   ECR_REPO:           "${{ secrets.ECR_REPO }}"
   IMAGE_TAG:          "1.2-1-cpu-py3"
@@ -77,11 +77,14 @@ jobs:
         kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
 
     - uses: actions/setup-python@v4
-      with: { python-version: '3.10' }
+      with:
+        python-version: '3.10'
 
     - name: Install Python deps
-      if: "${{ hashFiles('requirements.txt') != '' }}"
-      run: pip install -r requirements.txt
+      run: |
+        if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
+        # Ensure auto-heal dependencies
+        pip install requests
 
     # ---------- Predict step (numeric output via --plain) ----------
     - name: Predict failure probability (TEST MODE)
@@ -100,7 +103,8 @@ jobs:
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
-      env: { SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}" }
+      env:
+        SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
       run: |
         python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
         curl -X POST -H 'Content-Type: application/json' \

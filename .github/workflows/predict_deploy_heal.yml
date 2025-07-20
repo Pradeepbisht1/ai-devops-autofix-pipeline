@@ -44,14 +44,19 @@ jobs:
         done
 
     - name: Build & push APP image
+      id: build
       env: { DOCKER_BUILDKIT: 1 }
       run: |
+        build_start=$SECONDS
+
         docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
         docker tag  $ECR_REPO:${{ github.sha }} \
           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
         aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
           docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
         docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+
+        echo "build_time=$(( SECONDS - build_start ))" >> $GITHUB_OUTPUT
 
     - name: Upload model artefact
       run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
@@ -83,37 +88,61 @@ jobs:
     - name: Install Python deps
       run: |
         if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
-        pip install requests
+        pip install requests pytest jq sysstat
 
-    # ---------- Collect live build metrics ----------
+    # ---------- Run unit‑tests & gather quality metrics ----------
+    - name: Run tests and capture stats
+      id: tests
+      run: |
+        test_start=$SECONDS
+        pytest -q | tee test.log
+        elapsed=$(( SECONDS - test_start ))
+
+        passed=$(grep -oP "(?<= )[0-9]+(?= passed)" test.log || echo 0)
+        failed=$(grep -oP "(?<= )[0-9]+(?= failed)" test.log || echo 0)
+        errors=$(grep -oP "(?<= )[0-9]+(?= error)"  test.log || echo 0)
+        total=$(( passed + failed + errors ))
+        pass_rate=$(python - <<PY
+import sys,math; p=int(sys.argv[1]); t=int(sys.argv[2]); print(round(p/(t or 1),2))
+PY $passed $total)
+
+        echo "error_count=$errors"       >> $GITHUB_OUTPUT
+        echo "test_pass_rate=$pass_rate" >> $GITHUB_OUTPUT
+
+    # ---------- Compute average CPU during build & tests ----------
+    - name: Compute average CPU usage
+      id: cpu
+      run: |
+        # install mpstat (part of sysstat)
+        mpstat 1 5 > cpu.txt
+        avg_idle=$(awk '/Average/ {print $NF}' cpu.txt | tail -1)
+        cpu_usage=$(printf '%.0f' "$(echo "100-$avg_idle" | bc -l)")
+        echo "cpu_usage=$cpu_usage" >> $GITHUB_OUTPUT
+
+    # ---------- Collect all live metrics ----------
     - name: Collect build metrics
       id: metrics
       run: |
-        start=$SECONDS
-        # TODO: run real build/tests and capture metrics
-        build_time=$(( SECONDS - start ))
-        error_count=$(grep -c "ERROR" build.log 2>/dev/null || echo 0)
-        cpu_usage=60
-        test_pass_rate=0.85
-        metrics_json=$(jq -n -c \
-          --arg bt "$build_time" \
-          --arg ec "$error_count" \
-          --arg cu "$cpu_usage" \
-          --arg tpr "$test_pass_rate" \
+        build_time=${{ steps.build.outputs.build_time }}
+        error_count=${{ steps.tests.outputs.error_count }}
+        cpu_usage=${{ steps.cpu.outputs.cpu_usage }}
+        test_pass_rate=${{ steps.tests.outputs.test_pass_rate }}
+
+        metrics_json=$(jq -n -c --arg bt "$build_time" --arg ec "$error_count" --arg cu "$cpu_usage" --arg tpr "$test_pass_rate" \
           '{build_time:($bt|tonumber),error_count:($ec|tonumber),cpu_usage:($cu|tonumber),test_pass_rate:($tpr|tonumber)}')
+
         echo "Metrics → $metrics_json"
         echo "json=$metrics_json" >> $GITHUB_OUTPUT
-    # ------------------------------------------------
 
-    # ---------- Predict step (numeric output via --plain) ----------
+    # ---------- Predict step ----------
     - name: Predict failure probability
       id: predict
       run: |
         prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
         echo "Predicted failure probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # ----------------------------------------------------------------
 
+    # ---------- Auto‑heal ----------
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
       env:

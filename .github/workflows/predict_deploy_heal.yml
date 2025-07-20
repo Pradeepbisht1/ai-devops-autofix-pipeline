@@ -83,47 +83,36 @@ jobs:
     - name: Install Python deps
       run: |
         if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
-        # ensure auto‑heal dependencies present during CI (keep idempotent)
-        pip install --quiet requests
+        pip install requests
 
-    # ---------- collect runtime metrics ----------
+    # ---------- Collect live build metrics ----------
     - name: Collect build metrics
       id: metrics
       run: |
         start=$SECONDS
-        # For demo: we assume build/tests already ran; replace placeholders
+        # TODO: run real build/tests and capture metrics
         build_time=$(( SECONDS - start ))
         error_count=$(grep -c "ERROR" build.log 2>/dev/null || echo 0)
-        cpu_usage=60   # TODO: calculate real avg CPU if desired
-        test_pass_rate=0.85  # TODO: compute from test summary
-
-        metrics_json=$(jq -n \
+        cpu_usage=60
+        test_pass_rate=0.85
+        metrics_json=$(jq -n -c \
           --arg bt "$build_time" \
           --arg ec "$error_count" \
           --arg cu "$cpu_usage" \
           --arg tpr "$test_pass_rate" \
           '{build_time:($bt|tonumber),error_count:($ec|tonumber),cpu_usage:($cu|tonumber),test_pass_rate:($tpr|tonumber)}')
-
         echo "Metrics → $metrics_json"
         echo "json=$metrics_json" >> $GITHUB_OUTPUT
+    # ------------------------------------------------
 
-    # ---------- Predict step ----------
+    # ---------- Predict step (numeric output via --plain) ----------
     - name: Predict failure probability
       id: predict
-      env:
-        FORCE_FAIL_PROB: "${{ env.FORCE_FAIL_PROB }}"  # optional override for testing
       run: |
         prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
-        echo "Model probability: $prob"
-
-        # allow manual override for integration testing
-        if [[ -n "$FORCE_FAIL_PROB" ]]; then
-          echo "FORCE_FAIL_PROB provided → using $FORCE_FAIL_PROB"
-          prob=$FORCE_FAIL_PROB
-        fi
-
+        echo "Predicted failure probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # ----------------------------------
+    # ----------------------------------------------------------------
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"

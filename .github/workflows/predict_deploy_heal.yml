@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  AWS_DEFAULT_REGION: "${{ secrets.AWS_DEFAULT_REGION }}"
+  AWS_DEFAULT_REGION:  "${{ secrets.AWS_DEFAULT_REGION }}"
   AWS_ACCOUNT_ID:     "${{ secrets.AWS_ACCOUNT_ID }}"
   ECR_REPO:           "${{ secrets.ECR_REPO }}"
   IMAGE_TAG:          "1.2-1-cpu-py3"
@@ -44,8 +44,7 @@ jobs:
         done
 
     - name: Build & push APP image
-      env:
-        DOCKER_BUILDKIT: 1   # 🚀 enable modern builder
+      env: { DOCKER_BUILDKIT: 1 }
       run: |
         docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
         docker tag  $ECR_REPO:${{ github.sha }} \
@@ -78,27 +77,30 @@ jobs:
         kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
 
     - uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      with: { python-version: '3.10' }
 
     - name: Install Python deps
       if: "${{ hashFiles('requirements.txt') != '' }}"
       run: pip install -r requirements.txt
 
     # ---------- Predict step (numeric output via --plain) ----------
-    - name: Predict failure probability
+    - name: Predict failure probability (TEST MODE)
       id: predict
       run: |
         prob=$(python ml_model/predict_failure.py --plain --input-json \
           '{"build_time":250,"error_count":7,"cpu_usage":60,"test_pass_rate":0.70}')
-        echo "Predicted failure probability: $prob"  # 👀 visible in logs
+        echo "Predicted (real) probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+        # ------------------------------------------------------------
+        # 🔥 FORCE HIGH VALUE FOR AUTO‑HEAL TEST
+        echo "Overriding fail_prob to 0.90 for test purposes"
+        echo "fail_prob=0.90" >> $GITHUB_OUTPUT
+        # TODO: Remove the two lines above after Auto‑Heal validation
     # ----------------------------------------------------------------
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
-      env:
-        SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
+      env: { SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}" }
       run: |
         python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
         curl -X POST -H 'Content-Type: application/json' \

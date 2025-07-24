@@ -83,23 +83,16 @@ jobs:
     - name: Install Python deps
       run: |
         if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
-        pip install requests
+        pip install requests pytest
 
     # ---------- Collect live build & test metrics ----------
     - name: Collect build metrics
       id: metrics
       run: |
-        #######################################################
-        # 1) Measure build time for the already–built image
-        #######################################################
-        # Re‑run docker build with cache to time accurately
         build_start=$(date +%s)
         docker build --platform linux/amd64 -t $ECR_REPO:test-timer ./app >/dev/null
         build_time=$(( $(date +%s) - build_start ))
 
-        #######################################################
-        # 2) Run unit tests & capture failures / pass rate
-        #######################################################
         pytest -q | tee test.log || true
         failed=$(grep -oP '(?<= )[0-9]+(?= failed)' test.log || echo 0)
         passed=$(grep -oP '(?<= )[0-9]+(?= passed)' test.log || echo 0)
@@ -110,14 +103,8 @@ jobs:
           test_pass_rate=$(awk "BEGIN {printf \"%.2f\", $passed/$total}")
         fi
 
-        #######################################################
-        # 3) Average CPU usage during tests (quick sample)
-        #######################################################
         cpu_usage=$(mpstat 1 5 | awk '/Average/ {printf("%.0f",100-$NF)}')
 
-        #######################################################
-        # 4) Assemble JSON and export
-        #######################################################
         metrics_json=$(jq -n -c \
           --arg bt "$build_time" \
           --arg ec "$failed" \
@@ -129,14 +116,12 @@ jobs:
         echo "json=$metrics_json" >> $GITHUB_OUTPUT
     # --------------------------------------------------------
 
-    # ---------- Predict step (numeric output via --plain) ----------
     - name: Predict failure probability
       id: predict
       run: |
         prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
         echo "Predicted failure probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # ----------------------------------------------------------------
 
     - name: Auto‑heal if prob ≥ 0.75
       if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"

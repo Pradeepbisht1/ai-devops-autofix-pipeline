@@ -85,6 +85,9 @@ jobs:
         if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
         pip install requests pytest
 
+    - name: Export PYTHONPATH for tests
+      run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
     # ---------- Collect live build & test metrics ----------
     - name: Collect build metrics
       id: metrics

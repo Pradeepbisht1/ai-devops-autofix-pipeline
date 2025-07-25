@@ -69,13 +69,6 @@ jobs:
     - name: Bootstrap objects once
       run: kubectl apply -f kubernetes/bootstrap.yaml || true
 
-    - name: Rollout new image
-      env:
-        IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
-      run: |
-        kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
-        kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
-
     - uses: actions/setup-python@v4
       with:
         python-version: '3.10'
@@ -119,15 +112,27 @@ jobs:
         echo "json=$metrics_json" >> $GITHUB_OUTPUT
     # --------------------------------------------------------
 
+    # ---------- Predict step (early) ----------
     - name: Predict failure probability
       id: predict
       run: |
         prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
         echo "Predicted failure probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
+    # ----------------------------------------------------------------
 
-    - name: Auto‑heal if prob ≥ 0.75
-      if: "${{ steps.predict.outputs.fail_prob != '' && fromJson(steps.predict.outputs.fail_prob) >= 0.75 }}"
+    # ---------- Conditional Rollout based on prediction ----------
+    - name: Rollout new image
+      if: ${{ steps.predict.outputs.fail_prob && fromJson(steps.predict.outputs.fail_prob) < 0.7 }}
+      env:
+        IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
+      run: |
+        kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
+        kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
+    # ----------------------------------------------------------------
+
+    - name: Auto‑heal if high failure risk
+      if: ${{ steps.predict.outputs.fail_prob && fromJson(steps.predict.outputs.fail_prob) >= 0.7 }}
       env:
         SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
       run: |

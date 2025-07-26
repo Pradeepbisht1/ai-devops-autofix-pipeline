@@ -33,3 +33,11 @@ __pycache__/
 .env
 terraform/**/.terraform/
 terraform/**/terraform.tfstate*
+
+# Terraform secrets
+*.tfvars
+*.auto.tfvars
+*.tfvars.json
+terraform.tfstate*
+.terraform/
+crash.log

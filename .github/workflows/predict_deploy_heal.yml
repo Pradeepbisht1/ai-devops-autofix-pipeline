@@ -81,10 +81,20 @@ jobs:
     - name: Export PYTHONPATH for tests
       run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
 
+    # --- Improvement #1: ensure sysstat (mpstat) is available ---
+    - name: Install metrics tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y sysstat
+        mpstat -V || true
+    # -------------------------------------------------------------
+
     # ---------- Collect live build & test metrics ----------
     - name: Collect build metrics
       id: metrics
       run: |
+        set -euo pipefail
+
         build_start=$(date +%s)
         docker build --platform linux/amd64 -t $ECR_REPO:test-timer ./app >/dev/null
         build_time=$(( $(date +%s) - build_start ))
@@ -99,7 +109,10 @@ jobs:
           test_pass_rate=$(awk "BEGIN {printf \"%.2f\", $passed/$total}")
         fi
 
-        cpu_usage=$(mpstat 1 5 | awk '/Average/ {printf("%.0f",100-$NF)}')
+        # --- Improvement #2: guard cpu_usage if mpstat not available/output missing ---
+        cpu_usage_raw=$(mpstat 1 5 2>/dev/null | awk '/Average/ {printf("%.0f",100-$NF)}' || true)
+        cpu_usage=${cpu_usage_raw:-0}
+        # ------------------------------------------------------------------------------
 
         metrics_json=$(jq -n -c \
           --arg bt "$build_time" \

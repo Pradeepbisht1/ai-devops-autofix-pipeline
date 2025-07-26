@@ -81,38 +81,49 @@ jobs:
     - name: Export PYTHONPATH for tests
       run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
 
-    # --- Improvement #1: ensure sysstat (mpstat) is available ---
-    - name: Install metrics tools
+    # Ensure tools for metrics
+    - name: Install CLI tools (jq, sysstat)
       run: |
         sudo apt-get update
-        sudo apt-get install -y sysstat
+        sudo apt-get install -y jq sysstat
         mpstat -V || true
-    # -------------------------------------------------------------
 
-    # ---------- Collect live build & test metrics ----------
+    # ---------- Collect live build & test metrics (robust) ----------
     - name: Collect build metrics
       id: metrics
+      env:
+        TIMER_NO_CACHE: "${{ vars.TIMER_NO_CACHE || '0' }}"  # set to '1' to force no-cache for timer build
       run: |
         set -euo pipefail
 
+        # Optional: force no-cache to avoid 0s when cache hits
+        if [ "${TIMER_NO_CACHE}" = "1" ]; then NC="--no-cache"; else NC=""; fi
+
         build_start=$(date +%s)
-        docker build --platform linux/amd64 -t $ECR_REPO:test-timer ./app >/dev/null
+        docker build --platform linux/amd64 $NC -t $ECR_REPO:test-timer ./app >/dev/null
         build_time=$(( $(date +%s) - build_start ))
 
+        # Run tests
         pytest -q | tee test.log || true
-        failed=$(grep -oP '(?<= )[0-9]+(?= failed)' test.log || echo 0)
-        passed=$(grep -oP '(?<= )[0-9]+(?= passed)' test.log || echo 0)
+
+        # Robust summary parsing (matches "3 passed" / "1 failed")
+        failed=$(awk '/[0-9]+ failed/ {print $1}' test.log | tail -1)
+        passed=$(awk '/[0-9]+ passed/ {print $1}' test.log | tail -1)
+        : "${failed:=0}"
+        : "${passed:=0}"
         total=$(( passed + failed ))
         if [ "$total" -eq 0 ]; then
           test_pass_rate=0
         else
-          test_pass_rate=$(awk "BEGIN {printf \"%.2f\", $passed/$total}")
+          test_pass_rate=$(awk -v p="$passed" -v t="$total" 'BEGIN{printf "%.2f", (t>0)?p/t:0}')
         fi
 
-        # --- Improvement #2: guard cpu_usage if mpstat not available/output missing ---
-        cpu_usage_raw=$(mpstat 1 5 2>/dev/null | awk '/Average/ {printf("%.0f",100-$NF)}' || true)
-        cpu_usage=${cpu_usage_raw:-0}
-        # ------------------------------------------------------------------------------
+        # Reliable CPU usage from /proc/stat (delta over 1s)
+        read i1 t1 < <(awk 'NR==1{idle=$5; tot=0; for(i=2;i<=NF;i++) tot+=$i; print idle, tot}' /proc/stat)
+        sleep 1
+        read i2 t2 < <(awk 'NR==1{idle=$5; tot=0; for(i=2;i<=NF;i++) tot+=$i; print idle, tot}' /proc/stat)
+        cpu_usage=$(awk -v i1="$i1" -v t1="$t1" -v i2="$i2" -v t2="$t2" \
+                    'BEGIN{di=i2-i1; dt=t2-t1; if (dt<=0){print 0} else {printf "%.0f", 100*(1 - di/dt)}}')
 
         metrics_json=$(jq -n -c \
           --arg bt "$build_time" \
@@ -122,8 +133,17 @@ jobs:
           '{build_time:($bt|tonumber),error_count:($ec|tonumber),cpu_usage:($cu|tonumber),test_pass_rate:($tpr|tonumber)}')
 
         echo "Metrics → $metrics_json"
+        echo "$metrics_json" > metrics.json
         echo "json=$metrics_json" >> $GITHUB_OUTPUT
-    # --------------------------------------------------------
+
+    - name: Upload metrics artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-metrics-${{ github.run_id }}
+        path: |
+          test.log
+          metrics.json
+    # ---------------------------------------------------------------
 
     # ---------- Predict step (early) ----------
     - name: Predict failure probability
@@ -132,7 +152,6 @@ jobs:
         prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
         echo "Predicted failure probability: $prob"
         echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # ----------------------------------------------------------------
 
     # ---------- Conditional Rollout based on prediction ----------
     - name: Rollout new image
@@ -142,7 +161,6 @@ jobs:
       run: |
         kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
         kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
-    # ----------------------------------------------------------------
 
     - name: Auto‑heal if high failure risk
       if: ${{ steps.predict.outputs.fail_prob && fromJson(steps.predict.outputs.fail_prob) >= 0.7 }}

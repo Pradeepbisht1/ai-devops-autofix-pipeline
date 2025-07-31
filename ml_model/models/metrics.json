@@ -1,0 +1,28 @@
+{
+  "chosen_model": "gboost",
+  "cv": {
+    "roc_auc_mean": 0.9928711102261426,
+    "f1_mean": 0.792222455323806
+  },
+  "holdout": {
+    "roc_auc": 0.9933242146203132,
+    "f1": 0.7970716083276138,
+    "precision": 0.7910990009082652,
+    "recall": 0.8031350852927617,
+    "accuracy": 0.977825,
+    "n_train": 160000,
+    "n_test": 40000,
+    "positive_rate_train": 0.0542125,
+    "positive_rate_test": 0.054225
+  },
+  "features": [
+    "restart_count_last_5m",
+    "cpu_usage_pct",
+    "memory_usage_bytes",
+    "ready_replica_ratio",
+    "unavailable_replicas",
+    "network_receive_bytes_per_s",
+    "http_5xx_error_rate"
+  ],
+  "target": "failure"
+}

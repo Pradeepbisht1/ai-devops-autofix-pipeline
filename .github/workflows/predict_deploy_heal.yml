@@ -94,26 +94,46 @@ jobs:
           sudo apt-get install -y jq
 
       # ----------------- ROLLOUT FIRST -----------------
-      - name: Set new image & wait
+      - name: Set new image & wait (5m)
         env:
           IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
         run: |
+          set -euo pipefail
           kubectl -n $NS set image deployment/$DEPLOY $CTR=$IMAGE_URI
-          # tolerate lack of "watch" RBAC during rollout status
-          kubectl -n $NS rollout status deployment/$DEPLOY --timeout=180s || true
+          kubectl -n $NS rollout status deployment/$DEPLOY --timeout=5m
+
+      - name: Debug rollout failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "==== describe deploy ===="
+          kubectl -n $NS describe deploy/$DEPLOY || true
+          echo "==== rs (by selector) ===="
+          kubectl -n $NS get rs -l app=$DEPLOY -o wide || true
+          echo "==== pods ===="
+          kubectl -n $NS get pods -l app=$DEPLOY -o wide || true
+          echo "==== last 50 events ===="
+          kubectl -n $NS get events --sort-by=.lastTimestamp | tail -n 50 || true
+          echo "==== not-ready pod logs (first 100 lines) ===="
+          for p in $(kubectl -n $NS get pods -l app=$DEPLOY -o jsonpath='{.items[*].metadata.name}'); do
+            rdy=$(kubectl -n $NS get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+            if [ "$rdy" != "true" ]; then
+              echo "--- $p ---"
+              kubectl -n $NS logs "$p" --tail=100 || true
+            fi
+          done
 
       # ----------------- WARM-UP LOAD (generate CPU/mem) -----------------
-      - name: Generate warm-up load (30-60s)
+      - name: Generate warm-up load (60–90s)
         run: |
           set -euo pipefail
           kubectl -n $NS port-forward svc/$SVC 8080:80 >/tmp/app_pf.log 2>&1 &
           echo $! > /tmp/app_pf.pid
-          for i in {1..30}; do curl -sf http://127.0.0.1:8080/healthz && break || sleep 1; done
-          # Adjust endpoint/payload to your app
-          for i in {1..200}; do
+          for i in {1..60}; do curl -sf http://127.0.0.1:8080/healthz && break || sleep 1; done
+          # ~2000 requests, 20 concurrent -> real CPU/Net usage
+          seq 1 2000 | xargs -n1 -P20 -I{} \
             curl -s -m 2 http://127.0.0.1:8080/predict -H 'Content-Type: application/json' \
-              --data '{"x": 1}' >/dev/null || true
-          done
+              --data '{"x": {}}' >/dev/null || true
           kill $(cat /tmp/app_pf.pid) || true
 
       # ----------------- PROMETHEUS: COLLECT 7 FEATURES -----------------
@@ -128,8 +148,8 @@ jobs:
           # Ensure Prometheus service exists
           kubectl -n "$PROM_NS" get svc "$PROM_SVC" -o name
 
-          # PF Prometheus service
-          trap 'kill $(cat /tmp/pf.pid) 2>/dev/null || true; sleep 1; echo "--- pf.log (tail) ---"; tail -n 200 /tmp/pf.log 2>/dev/null || true' EXIT
+          # PF Prometheus service (safer trap)
+          trap 'p=$(cat /tmp/pf.pid 2>/dev/null || true); [ -n "$p" ] && kill "$p" 2>/dev/null || true; sleep 1; echo "--- pf.log (tail) ---"; tail -n 200 /tmp/pf.log 2>/dev/null || true' EXIT
           kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf.log 2>&1 &
           echo $! > /tmp/pf.pid
 
@@ -177,8 +197,11 @@ jobs:
           # 5) unavailable_replicas
           unavail = val(q(f'kube_deployment_status_replicas_unavailable{{namespace="{NS}",deployment="{DEPLOY}"}}'))
 
-          # 6) network_receive_bytes/s
-          net_rx = val(q(f'sum(rate(container_network_receive_bytes_total{{namespace="{NS}"} }[2m]) {join})'))
+          # 6) network_receive_bytes/s (owner-join first, fallback to namespace)
+          net_rx = first_nonzero([
+              f'sum(rate(container_network_receive_bytes_total{{namespace="{NS}",pod!=""}}[2m]) {join})',
+              f'sum(rate(container_network_receive_bytes_total{{namespace="{NS}"}}[2m]))'
+          ])
 
           # 7) http_5xx_error_rate (common metric names; default 0)
           http5xx = first_nonzero([
@@ -200,7 +223,7 @@ jobs:
           print("features:", json.dumps(features))
           with open("features.json","w") as f: json.dump(features,f)
 
-          # Call model (your updated predictor uses 7 features)
+          # Call model (7-feature predictor)
           prob = float(subprocess.check_output(
               f'python ml_model/predict_failure.py --plain --input-json \'{json.dumps(features)}\'',
               shell=True, text=True).strip())

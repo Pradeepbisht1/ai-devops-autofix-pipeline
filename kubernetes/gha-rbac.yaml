@@ -1,0 +1,46 @@
+# kubernetes/gha-rbac.yaml  (APP NAMESPACE, not monitoring)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gh-actions-app-access
+  namespace: prod               # <-- set to your $NS (prod in your repo)
+rules:
+  # Deployments & RS (for set image, rollout status/undo)
+  - apiGroups: ["apps"]
+    resources: ["deployments","replicasets"]
+    verbs: ["get","list","watch","update","patch","create"]  # create is harmless; keep for first-time apply
+
+  # Services/Endpoints (for apply + port-forward svc)
+  - apiGroups: [""]
+    resources: ["services","endpoints"]
+    verbs: ["get","list","watch","create","update","patch"]
+
+  # Pods (read & watch)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","list","watch"]
+
+  # Port-forward to Service resolves to a Pod; allow the subresource
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+
+  # (Optional) Events for better debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get","list","watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gh-actions-app-access-rb
+  namespace: prod               # <-- set to your $NS
+subjects:
+  - kind: Group
+    name: gh-actions-deployer   # mapped in aws-auth
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: gh-actions-app-access
+  apiGroup: rbac.authorization.k8s.io

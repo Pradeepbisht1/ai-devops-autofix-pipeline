@@ -1,4 +1,4 @@
-name: Predict, Deploy & Auto‑Heal Pipeline
+name: Predict, Deploy & Auto-Heal Pipeline
 
 on:
   workflow_dispatch:
@@ -21,135 +21,243 @@ jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
     env:
-      NS:     "${{ secrets.EKS_NAMESPACE        || 'prod' }}"
-      DEPLOY: "${{ secrets.EKS_DEPLOYMENT_NAME  || 'my-api-deployment' }}"
-      CTR:    "${{ secrets.EKS_CONTAINER_NAME   || 'api-container' }}"
+      NS:        "${{ secrets.EKS_NAMESPACE        || 'prod' }}"
+      DEPLOY:    "${{ secrets.EKS_DEPLOYMENT_NAME  || 'my-api-deployment' }}"
+      CTR:       "${{ secrets.EKS_CONTAINER_NAME   || 'api-container' }}"
+      SVC:       "${{ secrets.EKS_SERVICE_NAME     || 'my-api-service' }}"
+      PROM_NS:   "${{ secrets.PROM_NAMESPACE       || 'monitoring' }}"
+      PROM_SVC:  "${{ secrets.PROM_SERVICE_NAME    || 'prometheus-kube-prometheus-prometheus' }}"
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - uses: aws-actions/configure-aws-credentials@v2
-      with:
-        role-to-assume: "${{ secrets.AWS_ROLE_ARN }}"
-        aws-region:     "${{ env.AWS_DEFAULT_REGION }}"
+      - uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: "${{ secrets.AWS_ROLE_ARN }}"
+          aws-region:     "${{ env.AWS_DEFAULT_REGION }}"
 
-    - name: Who am I?
-      run: aws sts get-caller-identity
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
-    - name: Ensure ECR repos
-      run: |
-        for repo in "$ECR_REPO" sklearn-inference ; do
-          aws ecr describe-repositories --repository-names "$repo" ||
-          aws ecr create-repository --repository-name "$repo"
-        done
+      - name: Ensure ECR repos
+        run: |
+          for repo in "$ECR_REPO" sklearn-inference ; do
+            aws ecr describe-repositories --repository-names "$repo" ||
+            aws ecr create-repository --repository-name "$repo"
+          done
 
-    - name: Build & push APP image
-      env: { DOCKER_BUILDKIT: 1 }
-      run: |
-        docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
-        docker tag  $ECR_REPO:${{ github.sha }} \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
-        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+      - name: Build & push APP image
+        env: { DOCKER_BUILDKIT: 1 }
+        run: |
+          docker build --platform linux/amd64 -t $ECR_REPO:${{ github.sha }} ./app
+          docker tag  $ECR_REPO:${{ github.sha }} \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+            docker login -u AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:${{ github.sha }}
 
-    - name: Upload model artefact
-      run: aws s3 cp ml_model/models/model.tar.gz "$MODEL_S3_PATH"
+      - name: Upload model artefact (optional)
+        run: aws s3 cp ml_model/models/model.pkl "$MODEL_S3_PATH" || true
 
-    - name: Install kubectl
-      run: |
-        curl -sSL https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
-        chmod +x kubectl && sudo mv kubectl /usr/local/bin
+      - name: Install kubectl
+        run: |
+          curl -sSL https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin
 
-    - name: Configure kubeconfig
-      run: |
-        aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name "${{ secrets.EKS_CLUSTER_NAME }}"
-        kubectl get nodes
+      - name: Configure kubeconfig (namespaced check)
+        run: |
+          aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name "${{ secrets.EKS_CLUSTER_NAME }}"
+          kubectl -n $NS get deploy || kubectl -n $NS get pods || true
+          kubectl auth can-i watch deployments -n $NS || true
 
-    - name: Bootstrap objects once
-      run: kubectl apply -f kubernetes/bootstrap.yaml || true
+      # Apply only namespaced app objects
+      - name: Apply app manifests
+        run: |
+          kubectl -n $NS apply -f kubernetes/deployment.yaml
+          kubectl -n $NS apply -f kubernetes/service.yaml
 
-    - uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install Python deps
-      run: |
-        if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
-        pip install requests pytest
+      - name: Install Python deps
+        run: |
+          if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
+          pip install requests pytest joblib scikit-learn
 
-    - name: Export PYTHONPATH for tests
-      run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+      - name: Export PYTHONPATH for model
+        run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
 
-    # --- Improvement #1: ensure sysstat (mpstat) is available ---
-    - name: Install metrics tools
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y sysstat
-        mpstat -V || true
-    # -------------------------------------------------------------
+      - name: Install CLI tools (jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
-    # ---------- Collect live build & test metrics ----------
-    - name: Collect build metrics
-      id: metrics
-      run: |
-        set -euo pipefail
+      # ----------------- ROLLOUT FIRST -----------------
+      - name: Set new image & wait
+        env:
+          IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
+        run: |
+          kubectl -n $NS set image deployment/$DEPLOY $CTR=$IMAGE_URI
+          # tolerate lack of "watch" RBAC during rollout status
+          kubectl -n $NS rollout status deployment/$DEPLOY --timeout=180s || true
 
-        build_start=$(date +%s)
-        docker build --platform linux/amd64 -t $ECR_REPO:test-timer ./app >/dev/null
-        build_time=$(( $(date +%s) - build_start ))
+      # ----------------- WARM-UP LOAD (generate CPU/mem) -----------------
+      - name: Generate warm-up load (30-60s)
+        run: |
+          set -euo pipefail
+          kubectl -n $NS port-forward svc/$SVC 8080:80 >/tmp/app_pf.log 2>&1 &
+          echo $! > /tmp/app_pf.pid
+          for i in {1..30}; do curl -sf http://127.0.0.1:8080/healthz && break || sleep 1; done
+          # Adjust endpoint/payload to your app
+          for i in {1..200}; do
+            curl -s -m 2 http://127.0.0.1:8080/predict -H 'Content-Type: application/json' \
+              --data '{"x": 1}' >/dev/null || true
+          done
+          kill $(cat /tmp/app_pf.pid) || true
 
-        pytest -q | tee test.log || true
-        failed=$(grep -oP '(?<= )[0-9]+(?= failed)' test.log || echo 0)
-        passed=$(grep -oP '(?<= )[0-9]+(?= passed)' test.log || echo 0)
-        total=$(( passed + failed ))
-        if [ "$total" -eq 0 ]; then
-          test_pass_rate=0
-        else
-          test_pass_rate=$(awk "BEGIN {printf \"%.2f\", $passed/$total}")
-        fi
+      # ----------------- PROMETHEUS: COLLECT 7 FEATURES -----------------
+      - name: Predict failure probability from runtime metrics
+        id: predict
+        shell: bash
+        env:
+          THRESHOLD: "0.60"
+        run: |
+          set -euo pipefail
 
-        # --- Improvement #2: guard cpu_usage if mpstat not available/output missing ---
-        cpu_usage_raw=$(mpstat 1 5 2>/dev/null | awk '/Average/ {printf("%.0f",100-$NF)}' || true)
-        cpu_usage=${cpu_usage_raw:-0}
-        # ------------------------------------------------------------------------------
+          # Ensure Prometheus service exists
+          kubectl -n "$PROM_NS" get svc "$PROM_SVC" -o name
 
-        metrics_json=$(jq -n -c \
-          --arg bt "$build_time" \
-          --arg ec "$failed" \
-          --arg cu "$cpu_usage" \
-          --arg tpr "$test_pass_rate" \
-          '{build_time:($bt|tonumber),error_count:($ec|tonumber),cpu_usage:($cu|tonumber),test_pass_rate:($tpr|tonumber)}')
+          # PF Prometheus service
+          trap 'kill $(cat /tmp/pf.pid) 2>/dev/null || true; sleep 1; echo "--- pf.log (tail) ---"; tail -n 200 /tmp/pf.log 2>/dev/null || true' EXIT
+          kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf.log 2>&1 &
+          echo $! > /tmp/pf.pid
 
-        echo "Metrics → $metrics_json"
-        echo "json=$metrics_json" >> $GITHUB_OUTPUT
-    # --------------------------------------------------------
+          # Wait ready
+          for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
+          sleep 2
 
-    # ---------- Predict step (early) ----------
-    - name: Predict failure probability
-      id: predict
-      run: |
-        prob=$(python ml_model/predict_failure.py --plain --input-json '${{ steps.metrics.outputs.json }}')
-        echo "Predicted failure probability: $prob"
-        echo "fail_prob=$prob" >> $GITHUB_OUTPUT
-    # ----------------------------------------------------------------
+          python - <<'PY'
+          import requests, json, os, subprocess
 
-    # ---------- Conditional Rollout based on prediction ----------
-    - name: Rollout new image
-      if: ${{ steps.predict.outputs.fail_prob && fromJson(steps.predict.outputs.fail_prob) < 0.7 }}
-      env:
-        IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
-      run: |
-        kubectl set image deployment/$DEPLOY $CTR=$IMAGE_URI -n $NS
-        kubectl rollout status deployment/$DEPLOY -n $NS --timeout=180s
-    # ----------------------------------------------------------------
+          NS=os.getenv('NS'); DEPLOY=os.getenv('DEPLOY'); THR=float(os.getenv('THRESHOLD',"0.6"))
+          PURL='http://127.0.0.1:9090/api/v1/query'
 
-    - name: Auto‑heal if high failure risk
-      if: ${{ steps.predict.outputs.fail_prob && fromJson(steps.predict.outputs.fail_prob) >= 0.7 }}
-      env:
-        SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
-      run: |
-        python pipeline/scripts/smart_auto_heal.py --deployment $DEPLOY --namespace $NS --replicas 3
-        curl -X POST -H 'Content-Type: application/json' \
-             --data "{\"text\":\"🚑 Auto‑heal triggered (fail_prob=${{ steps.predict.outputs.fail_prob }}).\"}" \
-             "$SLACK_WEBHOOK_URL"
+          def q(expr):
+              r=requests.get(PURL, params={'query':expr}, timeout=10)
+              r.raise_for_status()
+              return r.json()
+
+          def val(js):
+              try: return float(js['data']['result'][0]['value'][1])
+              except: return 0.0
+
+          def first_nonzero(exprs):
+              for e in exprs:
+                  v = val(q(e))
+                  if v > 0: return v
+              return 0.0
+
+          join = f'* on(pod,namespace) group_left(owner_kind,owner_name) kube_pod_owner{{namespace="{NS}",owner_kind="Deployment",owner_name="{DEPLOY}"}}'
+
+          # 1) restart_count_last_5m
+          restarts = val(q(f'sum(increase(kube_pod_container_status_restarts_total{{namespace="{NS}"}}[5m]) {join})'))
+
+          # 2) cpu_usage_% 
+          cpu = val(q(f'sum(rate(container_cpu_usage_seconds_total{{namespace="{NS}",container!="POD",image!=""}}[2m]) {join}) * 100'))
+
+          # 3) memory_usage_bytes
+          mem = val(q(f'sum(container_memory_working_set_bytes{{namespace="{NS}",container!="POD",image!=""}} {join})'))
+
+          # 4) ready_replica_ratio
+          des = val(q(f'kube_deployment_spec_replicas{{namespace="{NS}",deployment="{DEPLOY}"}}'))
+          rdy = val(q(f'kube_deployment_status_ready_replicas{{namespace="{NS}",deployment="{DEPLOY}"}}'))
+          ready_ratio = (rdy/des) if des > 0 else 1.0
+
+          # 5) unavailable_replicas
+          unavail = val(q(f'kube_deployment_status_replicas_unavailable{{namespace="{NS}",deployment="{DEPLOY}"}}'))
+
+          # 6) network_receive_bytes/s
+          net_rx = val(q(f'sum(rate(container_network_receive_bytes_total{{namespace="{NS}"} }[2m]) {join})'))
+
+          # 7) http_5xx_error_rate (common metric names; default 0)
+          http5xx = first_nonzero([
+              f'sum(rate(http_server_requests_seconds_count{{namespace="{NS}",status=~"5.."}}[2m]))',
+              f'sum(rate(flask_http_request_total{{namespace="{NS}",status=~"5.."}}[2m]))',
+              f'sum(rate(http_requests_total{{namespace="{NS}",code=~"5.."}}[2m]))'
+          ])
+
+          features = {
+            "restart_count_last_5m": restarts,
+            "cpu_usage_pct": cpu,
+            "memory_usage_bytes": mem,
+            "ready_replica_ratio": round(ready_ratio, 4),
+            "unavailable_replicas": unavail,
+            "network_receive_bytes_per_s": net_rx,
+            "http_5xx_error_rate": http5xx
+          }
+
+          print("features:", json.dumps(features))
+          with open("features.json","w") as f: json.dump(features,f)
+
+          # Call model (your updated predictor uses 7 features)
+          prob = float(subprocess.check_output(
+              f'python ml_model/predict_failure.py --plain --input-json \'{json.dumps(features)}\'',
+              shell=True, text=True).strip())
+          print("prob:", prob)
+
+          high = prob > THR
+
+          # Insufficient-signal guard: no CPU & no restarts & healthy replicas
+          if cpu == 0.0 and restarts == 0.0 and ready_ratio >= 1.0:
+              print("Low signal; forcing low-risk decision for this run.")
+              high = False
+
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f"fail_prob={prob}\n")
+              f.write(f"highrisk={'true' if high else 'false'}\n")
+          PY
+
+      - name: Upload features artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: features-${{ github.run_id }}
+          path: features.json
+
+      # ----------------- DECISION -----------------
+      - name: Cooldown guard
+        id: cooldown
+        env:
+          COOLDOWN_MIN: "15"
+        run: |
+          set -euo pipefail
+          ts=$(kubectl -n "$NS" get deploy "$DEPLOY" -o jsonpath='{.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}' || true)
+          if [ -n "${ts:-}" ]; then last=$(date -d "$ts" +%s || echo 0); else last=0; fi
+          now=$(date +%s); gap=$(( now - last )); need=$(( ${COOLDOWN_MIN} * 60 ))
+          echo "seconds_since_last_restart=$gap"
+          if [ "$gap" -lt "$need" ]; then echo "cooldown=true" >> $GITHUB_OUTPUT; else echo "cooldown=false" >> $GITHUB_OUTPUT; fi
+
+      - name: Rollback + alert (risk high AND cooldown passed)
+        if: ${{ steps.predict.outputs.highrisk == 'true' && steps.cooldown.outputs.cooldown == 'false' }}
+        env:
+          SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" rollout undo deployment/"$DEPLOY"
+          kubectl -n "$NS" annotate deployment/"$DEPLOY" kubectl.kubernetes.io/restartedAt="$(date -Is)" --overwrite
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            printf ':rotating_light: *High risk detected* (p=%.2f) → rolled back `%s` in `%s`.\n' "${{ steps.predict.outputs.fail_prob }}" "$DEPLOY" "$NS" \
+            | jq -Rs '{text: .}' \
+            | curl -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+          fi
+
+      - name: Success notice (kept rollout)
+        if: ${{ steps.predict.outputs.highrisk != 'true' }}
+        env:
+          SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
+        run: |
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            printf ':white_check_mark: Rollout *kept*. Risk p=%.2f for `%s` in `%s`.\n' "${{ steps.predict.outputs.fail_prob }}" "$DEPLOY" "$NS" \
+            | jq -Rs '{text: .}' \
+            | curl -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+          fi

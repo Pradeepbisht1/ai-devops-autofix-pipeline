@@ -95,36 +95,69 @@ jobs:
 
       # ----------------- ROLLOUT FIRST -----------------
       - name: Set new image & wait (5m)
+        id: rollout
+        continue-on-error: true
         env:
           IMAGE_URI: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
         run: |
           set -euo pipefail
           kubectl -n $NS set image deployment/$DEPLOY $CTR=$IMAGE_URI
-          kubectl -n $NS rollout status deployment/$DEPLOY --timeout=5m
+          if kubectl -n $NS rollout status deployment/$DEPLOY --timeout=5m; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+          else
+            echo "status=timeout" >> $GITHUB_OUTPUT
+            exit 1
+          fi
 
       - name: Debug rollout failure
-        if: failure()
+        if: ${{ steps.rollout.outcome == 'failure' }}
         run: |
           set -euo pipefail
           echo "==== describe deploy ===="
           kubectl -n $NS describe deploy/$DEPLOY || true
-          echo "==== rs (by selector) ===="
-          kubectl -n $NS get rs -l app=$DEPLOY -o wide || true
+
+          echo "==== build selector from deployment ===="
+          SELECTOR=$(kubectl -n $NS get deploy $DEPLOY -o json \
+            | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+          echo "selector: $SELECTOR"
+
+          echo "==== replica sets ===="
+          kubectl -n $NS get rs -l "$SELECTOR" -o wide || true
+
           echo "==== pods ===="
-          kubectl -n $NS get pods -l app=$DEPLOY -o wide || true
+          kubectl -n $NS get pods -l "$SELECTOR" -o wide || true
+
           echo "==== last 50 events ===="
           kubectl -n $NS get events --sort-by=.lastTimestamp | tail -n 50 || true
-          echo "==== not-ready pod logs (first 100 lines) ===="
-          for p in $(kubectl -n $NS get pods -l app=$DEPLOY -o jsonpath='{.items[*].metadata.name}'); do
+
+          echo "==== crashing pod logs (current/previous) ===="
+          for p in $(kubectl -n $NS get pods -l "$SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
+            cname=$(kubectl -n $NS get pod "$p" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || echo "")
             rdy=$(kubectl -n $NS get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
             if [ "$rdy" != "true" ]; then
-              echo "--- $p ---"
-              kubectl -n $NS logs "$p" --tail=100 || true
+              echo "--- $p (container=$cname) [current] ---"
+              kubectl -n $NS logs "$p" -c "$cname" --tail=120 || true
+              echo "--- $p (container=$cname) [previous] ---"
+              kubectl -n $NS logs "$p" -c "$cname" --previous --tail=120 || true
             fi
           done
 
+      # Gate: require at least 1 ready pod before warm-up & metrics
+      - name: Check readiness
+        id: ready
+        run: |
+          set -euo pipefail
+          SELECTOR=$(kubectl -n $NS get deploy $DEPLOY -o json \
+            | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+          READY=$(kubectl -n $NS get pods -l "$SELECTOR" \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' | grep -c '^true$' || true)
+          echo "selector=$SELECTOR" >> $GITHUB_OUTPUT
+          if [ "${READY:-0}" -ge 1 ]; then echo "ok=true"  >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          echo "ready_pods=${READY:-0}"
+
       # ----------------- WARM-UP LOAD (generate CPU/mem) -----------------
       - name: Generate warm-up load (60–90s)
+        if: ${{ steps.ready.outputs.ok == 'true' }}
         run: |
           set -euo pipefail
           kubectl -n $NS port-forward svc/$SVC 8080:80 >/tmp/app_pf.log 2>&1 &
@@ -134,11 +167,12 @@ jobs:
           seq 1 2000 | xargs -n1 -P20 -I{} \
             curl -s -m 2 http://127.0.0.1:8080/predict -H 'Content-Type: application/json' \
               --data '{"x": {}}' >/dev/null || true
-          kill $(cat /tmp/app_pf.pid) || true
+          kill $(cat /tmp/app_pf.pid) 2>/dev/null || true
 
       # ----------------- PROMETHEUS: COLLECT 7 FEATURES -----------------
       - name: Predict failure probability from runtime metrics
         id: predict
+        if: ${{ steps.ready.outputs.ok == 'true' }}
         shell: bash
         env:
           THRESHOLD: "0.60"
@@ -242,6 +276,7 @@ jobs:
           PY
 
       - name: Upload features artifact
+        if: ${{ steps.ready.outputs.ok == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: features-${{ github.run_id }}
@@ -275,7 +310,7 @@ jobs:
           fi
 
       - name: Success notice (kept rollout)
-        if: ${{ steps.predict.outputs.highrisk != 'true' }}
+        if: ${{ steps.predict.outputs.highrisk != 'true' && steps.ready.outputs.ok == 'true' }}
         env:
           SLACK_WEBHOOK_URL: "${{ secrets.SLACK_WEBHOOK_URL }}"
         run: |

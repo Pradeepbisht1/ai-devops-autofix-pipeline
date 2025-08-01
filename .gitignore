@@ -18,6 +18,11 @@ ml_model/venv/
 terraform.tfvars     # if it has secrets (or keep a separate example file)
 temp.yaml           # if this is generated with sensitive values
 
+# === Model artifacts (you fetch from S3/workflow) ===
+ml_model/models/model.tar.gz
+model.tar.gz
+ml_model/prom_features.csv
+
 # === Secrets / envs ===
 *.env
 *.secret

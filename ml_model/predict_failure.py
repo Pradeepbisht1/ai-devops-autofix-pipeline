@@ -48,6 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger("predict_failure")
 
 # --- model loading & fallback -------------------------------------- #
+
 def load_model() -> Tuple[object | None, list[str]]:
     if MODEL_PATH.exists():
         try:
@@ -121,6 +122,7 @@ def predict_from_dict(sample: dict, model_obj, feature_order: list[str]) -> floa
 
 
 # --- CLI ------------------------------------------------------------ #
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Predict deployment failure probability from runtime metrics."
@@ -177,6 +179,15 @@ def load_input(raw: str | None) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    # -----------------------------------------------------------------
+    # Suppress banner logs when running in --plain mode so the CI gets
+    # *only* the numeric probability on stdout. Important that this
+    # happens **before** model loading so "Loaded model ..." message
+    # doesn’t pollute the output.
+    # -----------------------------------------------------------------
+    if args.plain:
+        logging.getLogger("predict_failure").setLevel(logging.WARNING)
 
     sample = load_input(args.input_json)
     model_obj, feature_order = load_model()

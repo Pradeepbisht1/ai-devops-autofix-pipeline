@@ -6,6 +6,7 @@ import time
 from functools import wraps
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from prometheus_client import (
     Counter,
     Gauge,
@@ -28,6 +29,7 @@ logger = logging.getLogger("app")
 # Flask & Middleware
 # -------------------------------------------------------------------
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})  # enable CORS for dev; restrict in prod
 app.wsgi_app = ProxyFix(app.wsgi_app)
 
 # -------------------------------------------------------------------
@@ -36,7 +38,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app)
 HTTP_REQS = Counter("http_request_total", "HTTP requests", ["method", "status"])
 FAILURE_PROB = Gauge(
     "predicted_failure_probability", "Predicted failure probability"
-)  # currently unused but reserved
+)  # reserved
 PREDICT_DURATION = Summary(
     "predict_duration_seconds", "Time taken for prediction"
 )
@@ -45,6 +47,7 @@ PREDICT_DURATION = Summary(
 # Simple in-memory rate limiter (for dev). For prod use Redis or API-gateway.
 # -------------------------------------------------------------------
 REQUEST_COUNTS: dict[str, int] = {}
+
 
 def rate_limit(limit: int = 100):
     """Decorator that limits number of calls per IP (naïve, resets on restart)."""
@@ -63,6 +66,7 @@ def rate_limit(limit: int = 100):
         return wrapped
 
     return decorator
+
 
 # -------------------------------------------------------------------
 # Index & Health endpoints
@@ -90,6 +94,7 @@ def healthz():
     HTTP_REQS.labels(method="GET", status="200").inc()
     return jsonify({"status": "ok"}), 200
 
+
 # -------------------------------------------------------------------
 # Predict endpoint (dummy implementation for now)
 # -------------------------------------------------------------------
@@ -100,22 +105,25 @@ def predict():
     try:
         # Simulate some CPU-work (replace with real model inference)
         s = sum(i * i for i in range(30_000))
-        result = {"y": s % 7}
+        y = s % 7
+        prob = float(y) / 7.0  # normalized dummy probability for demonstration
+        FAILURE_PROB.set(prob)
 
         # Failure-injection for chaos testing
         if random.random() < float(os.getenv("FAILURE_INJECTION_PROB", "0.0")):
             HTTP_REQS.labels(method="POST", status="500").inc()
             logger.error(json.dumps({"event": "inject_failure", "reason": "test"}))
-            return jsonify({"error": "internal"}), 500
+            return jsonify({"error": "internal", "prob": prob}), 500
 
         HTTP_REQS.labels(method="POST", status="200").inc()
-        return jsonify(result), 200
+        return jsonify({"y": y, "prob": prob}), 200
     except Exception as e:  # noqa: BLE001
         HTTP_REQS.labels(method="POST", status="500").inc()
         logger.exception("Predict failure: %s", e)
-        return jsonify({"error": "internal"}), 500
+        return jsonify({"error": "internal", "prob": 0.0}), 500
     finally:
         PREDICT_DURATION.observe(time.time() - start)
+
 
 # -------------------------------------------------------------------
 # Prometheus scrape endpoint
@@ -123,6 +131,7 @@ def predict():
 @app.get("/metrics")
 def metrics():
     return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
 
 # -------------------------------------------------------------------
 # Entrypoint

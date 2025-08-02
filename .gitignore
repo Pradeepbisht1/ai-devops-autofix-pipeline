@@ -44,3 +44,6 @@ Thumbs.db
 # === Misc ===
 coverage/
 htmlcov/
+ml_model/models/model.pkl
+terraform/terraform.tfvars
+dashboard/node_modules/

@@ -1,43 +1,46 @@
-__pycache__/
+# === Node / frontend ===
+dashboard/node_modules/
+dashboard/dist/
 *.log
+
+# === Python ===
+**/venv/
 *.pyc
-*.ipynb_checkpoints
-.env
-.vscode/
-.idea/
-# ─── Terraform ───────────────────────────────────────────
-terraform/.terraform/        # provider cache
-terraform/*.tfstate*         # state files & backups
-terraform/*.tfvars           # personal or env‑specific vars
-terraform/*.auto.tfvars      # auto‑loaded var files
-terraform/crash.log          # crash logs
-terraform/*-override.tf*     # local overrides
-*.tfplan                      # plan output files
-*.pem *.key *.crt            # any keys/certs lying around
-# ─── Extra ignores we missed ───────────────────────────
-# Docker build artefacts
-docker/
-*.tar
-
-# ML model binaries & temp images
-ml_model/*.pkl
-ml_model/*.tar
-ml_model/image.tar
-
-# Python noise
 __pycache__/
-*.py[cod]
+app/src/venv/
+ml_model/venv/
+*.egg-info/
 
-# VSCode / env files (optional)
-.vscode/
-.env
-terraform/**/.terraform/
-terraform/**/terraform.tfstate*
-
-# Terraform secrets
-*.tfvars
-*.auto.tfvars
-*.tfvars.json
-terraform.tfstate*
+# === Terraform ===
+*.tfstate
+*.tfstate.backup
 .terraform/
-crash.log
+terraform.tfvars     # if it has secrets (or keep a separate example file)
+temp.yaml           # if this is generated with sensitive values
+
+# === Model artifacts (you fetch from S3/workflow) ===
+ml_model/models/model.tar.gz
+model.tar.gz
+ml_model/prom_features.csv
+
+# === Secrets / envs ===
+*.env
+*.secret
+credentials.json
+aws_credentials
+# if you use some config with keys
+*.key
+*.pem
+
+# === Git LFS metadata (auto if you track with LFS) ===
+.gitattributes
+
+# === OS / editor noise ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# === Misc ===
+coverage/
+htmlcov/

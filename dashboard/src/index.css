@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global */
+:root {
+  --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@layer base {
+  body {
+    @apply bg-gradient-to-br from-zinc-900 via-slate-900 to-slate-800 font-sans antialiased text-slate-100;
+  }
+  h1, h2, h3 {
+    @apply text-center font-semibold;
+  }
+  code {
+    @apply bg-zinc-800 px-1 rounded text-xs font-mono;
+  }
+
+  /* Smooth scroll for anchor jumps if needed */
+  html {
+    scroll-behavior: smooth;
+  }
+
+  /*Scrollbar (optional subtle)*/
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.15) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: rgba(255,255,255,0.15);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+}
+
+/* Utility classes / components overrides */
+@layer components {
+  .card-custom {
+    @apply rounded-xl shadow-card bg-gradient-to-tr from-card to-surface border border-border;
+  }
+  .btn-primary {
+    @apply bg-primary hover:bg-primary-dark text-white font-medium py-2 px-4 rounded-lg shadow hover:shadow-glow transition-transform;
+  }
+  .input-custom {
+    @apply bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-accent;
+  }
+  .centered {
+    @apply flex flex-col items-center justify-center;
+  }
+  .badge {
+    @apply bg-zinc-800 px-3 py-1 rounded flex items-center gap-1 text-xs ring-1 ring-zinc-700;
+  }
+}
+
+/* Specific tweaks for the gauge / probability card to stand out */
+.probability-value {
+  @apply text-5xl font-bold;
+}
+.risk-label-high {
+  @apply text-rose-400 font-semibold;
+}
+.risk-label-ok {
+  @apply text-emerald-400 font-semibold;
+}

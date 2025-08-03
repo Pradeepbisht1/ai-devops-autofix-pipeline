@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: prod
+  labels: { app: backend }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: backend }
+  template:
+    metadata:
+      labels: { app: backend }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsNonRoot: true
+      containers:
+      - name: backend            # must match BACKEND_CONTAINER
+        image: public.ecr.aws/docker/library/python:3.10-slim  # placeholder; CI set-image karega
+        imagePullPolicy: IfNotPresent
+        ports: [{ containerPort: 5000, name: http }]
+        env:
+        - { name: PORT, value: "5000" }
+        - { name: LOG_LEVEL, value: "INFO" }
+        - { name: MODEL_PATH, value: "/app/ml_model/models/model.pkl" }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5000 }
+          periodSeconds: 20
+        resources:
+          requests: { cpu: "200m", memory: "256Mi" }
+          limits:   { cpu: "1",    memory: "1Gi" }

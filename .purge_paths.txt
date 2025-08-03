@@ -1,0 +1,6 @@
+terraform/terraform.tfvars
+ml_model/models/model.pkl
+ml_model/data.csv
+dashboard/dist
+.venv
+venv

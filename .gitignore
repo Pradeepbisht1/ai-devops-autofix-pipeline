@@ -18,14 +18,17 @@ htmlcov/
 
 ########## 2. Node / Vite Front-end ###########################################
 dashboard/node_modules/
-dashboard/dist/         # Vite build output
+dashboard/dist/      
 
 
-########## 4. Terraform #######################################################
+# Terraform
 *.tfstate
 *.tfstate.backup
 .terraform/
-terraform/terraform.tfvars     # contains secrets – keep an example file instead
+terraform.tfvars
+terraform/*.tfvars
+
+
 # Generated temp YAML files
 temp.yaml
 

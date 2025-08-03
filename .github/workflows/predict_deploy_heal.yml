@@ -13,23 +13,23 @@ env:
   AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
   EKS_CLUSTER_NAME:    ${{ secrets.EKS_CLUSTER_NAME }}
-  EKS_NAMESPACE:       ${{ secrets.EKS_NAMESPACE || 'ai-devops' }}
+  EKS_NAMESPACE:       prod
 
-  # ECR repos (do alag)
+  # ECR repos (two separate)
   BACKEND_REPO:        myapp
   FRONTEND_REPO:       ai-devops-frontend
 
-  # Prometheus service (kube-prometheus-stack install hone ke baad verify karo)
+  # Prometheus service (verify with: kubectl -n monitoring get svc)
   PROM_NAMESPACE:      monitoring
-  PROM_SERVICE_NAME:   kube-prometheus-stack-prometheus   # `kubectl -n monitoring get svc` se confirm
+  PROM_SERVICE_NAME:   prometheus-operated
 
-  # K8s naming (manifests ke labels/names ke saath match rakho)
+  # K8s naming (must match your manifests)
   BACKEND_DEPLOY:      backend
   BACKEND_CONTAINER:   backend
-  BACKEND_SERVICE:     backend           # ClusterIP svc on port 5000
+  BACKEND_SERVICE:     backend          # ClusterIP svc on port 5000
   FRONTEND_DEPLOY:     frontend
   FRONTEND_CONTAINER:  frontend
-  FRONTEND_SERVICE:    frontend          # LB/Ingress svc on port 80
+  FRONTEND_SERVICE:    frontend         # LB/Ingress svc on port 80
 
   RISK_THRESHOLD:      "0.70"
 
@@ -81,7 +81,7 @@ jobs:
           docker push "$IMAGE_URI"
           echo "FRONTEND_IMAGE=$IMAGE_URI" >> $GITHUB_ENV
 
-      # (Optional) model artifact to S3 (if you keep external copy)
+      # (Optional) model artifact to S3
       - name: Upload model artefact (optional)
         run: |
           if [ -f ml_model/models/model.pkl ] && [ -n "${{ secrets.MODEL_S3_PATH }}" ]; then
@@ -97,13 +97,10 @@ jobs:
       - name: Configure kubeconfig
         run: |
           aws eks update-kubeconfig --region "${AWS_DEFAULT_REGION}" --name "${EKS_CLUSTER_NAME}"
-          kubectl get ns "${EKS_NAMESPACE}" >/dev/null 2>&1 || kubectl create ns "${EKS_NAMESPACE}"
 
       # ---------- Apply manifests (backend, frontend, svc, ingress, hpa, servicemonitor) ----------
       - name: Apply Kubernetes manifests
         run: |
-          # Replace placeholders in images directly via kubectl set image
-          kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/namespace.yaml || true
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-svc.yaml
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-svc.yaml
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-servicemonitor.yaml || true
@@ -124,6 +121,13 @@ jobs:
 
       - name: Wait for frontend rollout
         run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${FRONTEND_DEPLOY} --timeout=5m
+
+      # ---------- Tooling needed for later steps ----------
+      - name: Install jq and Python deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
 
       # ---------- Warm-up backend (optional) ----------
       - name: Warm-up backend for real metrics
@@ -159,10 +163,10 @@ jobs:
           trap 'kill $(cat /tmp/pf_prom.pid) 2>/dev/null || true' EXIT
           for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
 
-          py() { python - "$@"; }
+          py() { python3 - "$@"; }
 
           FEATURES=$(py <<'PY'
-          import json,requests,os,sys,time
+          import json,requests,os
           ns=os.getenv("NS"); dep=os.getenv("DEP")
           url="http://127.0.0.1:9090/api/v1/query"
           def q(e):
@@ -207,8 +211,8 @@ jobs:
 
           echo "Features: $FEATURES"
 
-          # Call backend /predict via PF
-          kubectl -n "${NS}" port-forward svc/${DEP} 5000:5000 >/tmp/pf-backend2.log 2>&1 &
+          # Call backend /predict via PF (service, not deployment)
+          kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend2.log 2>&1 &
           echo $! > /tmp/pf_backend2.pid
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
 
@@ -245,7 +249,6 @@ jobs:
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
         run: |
           set -euo pipefail
-          # quick cool-down
           sleep 60
 
           # PF prom
@@ -254,8 +257,7 @@ jobs:
           trap 'kill $(cat /tmp/pf_prom2.pid) 2>/dev/null || true' EXIT
           for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
 
-          # (same Python as before, compacted)
-          FEATURES=$(python - <<'PY'
+          FEATURES=$(python3 - <<'PY'
           import json,requests,os
           ns=os.getenv("NS"); dep=os.getenv("DEP"); url="http://127.0.0.1:9090/api/v1/query"
           def q(e): return requests.get(url,params={'query':e},timeout=10).json()
@@ -293,8 +295,8 @@ jobs:
           PY
           )
 
-          # call /predict again
-          kubectl -n "${NS}" port-forward svc/${DEP} 5000:5000 >/tmp/pf-backend3.log 2>&1 &
+          # call /predict again (service, not deployment)
+          kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend3.log 2>&1 &
           echo $! > /tmp/pf_backend3.pid
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
 
@@ -332,7 +334,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg="🚨 Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
+            msg=" Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' \
               | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi

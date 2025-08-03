@@ -1,49 +1,51 @@
-# === Node / frontend ===
-dashboard/node_modules/
-dashboard/dist/
-*.log
+###############################################################################
+#  AI-DevOps-Autofix-Pipeline – master .gitignore
+#  (Python backend · React/Vite frontend · Terraform · Docker)
+###############################################################################
 
-# === Python ===
-**/venv/
-*.pyc
-__pycache__/
-app/src/venv/
-ml_model/venv/
+########## 1. Python ##########################################################
+# Virtual-envs & build artefacts
+**/venv/                # any venv folder anywhere
+.venv/
+venv/
 *.egg-info/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+coverage/
+htmlcov/
 
-# === Terraform ===
+########## 2. Node / Vite Front-end ###########################################
+dashboard/node_modules/
+dashboard/dist/         # Vite build output
+
+
+########## 4. Terraform #######################################################
 *.tfstate
 *.tfstate.backup
 .terraform/
-terraform.tfvars     # if it has secrets (or keep a separate example file)
-temp.yaml           # if this is generated with sensitive values
+terraform/terraform.tfvars     # contains secrets – keep an example file instead
+# Generated temp YAML files
+temp.yaml
 
-# === Model artifacts (you fetch from S3/workflow) ===
-ml_model/models/model.tar.gz
-model.tar.gz
-ml_model/prom_features.csv
-
-# === Secrets / envs ===
+########## 5. Secrets / credentials ###########################################
 *.env
 *.secret
+*.pem
+*.key
 credentials.json
 aws_credentials
-# if you use some config with keys
-*.key
-*.pem
 
-# === Git LFS metadata (auto if you track with LFS) ===
-.gitattributes
-
-# === OS / editor noise ===
+########## 6. Logs & misc #####################################################
+*.log
+# Docker build cache folders
+**/dist/                 # if any other dist folders appear
+# OS / editor noise
 .DS_Store
 Thumbs.db
-*.swp
-*.swo
+*.sw[op]                 # Vim swap files
 
-# === Misc ===
-coverage/
-htmlcov/
-ml_model/models/model.pkl
-terraform/terraform.tfvars
-dashboard/node_modules/
+########## 7. Git LFS #########################################################
+.gitattributes           # tracked automatically when you ran `git lfs track`
+###############################################################################

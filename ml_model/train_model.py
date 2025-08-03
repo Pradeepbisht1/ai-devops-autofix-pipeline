@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import joblib
 import numpy as np
@@ -11,12 +11,14 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (accuracy_score, f1_score, precision_score,
-                             recall_score, roc_auc_score)
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+)
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler, FunctionTransformer
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 
 # ----------------------------- Config -------------------------------- #
@@ -31,7 +33,7 @@ CANONICAL_FEATURES = [
     "http_5xx_error_rate",
 ]
 
-# Common aliases you might have in CSV; they’ll be normalized
+# Aliases you might have in CSV; normalized below
 ALIASES = {
     "cpu_usage_%": "cpu_usage_pct",
     "cpu_usage": "cpu_usage_pct",
@@ -46,22 +48,27 @@ ALIASES = {
 
 DEFAULT_TARGETS = ["is_failure", "failure", "label", "y"]  # first that exists is used
 
+HEAVY_TAIL = ["restart_count_last_5m", "memory_usage_bytes", "network_receive_bytes_per_s"]
+REST = ["cpu_usage_pct", "ready_replica_ratio", "unavailable_replicas", "http_5xx_error_rate"]
+
 
 # ------------------------- Utility functions ------------------------- #
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # strip spaces and unify case
+    df.columns = df.columns.str.strip()
+    # apply aliases
     rename_map = {c: ALIASES.get(c, c) for c in df.columns}
     df = df.rename(columns=rename_map)
-
-    # If percent stored like 0–1, convert to 0–100 (heuristic)
+    # if cpu is 0..1, convert to percent
     if "cpu_usage_pct" in df.columns:
-        cpu = df["cpu_usage_pct"].astype(float)
-        if cpu.max() <= 1.0:
+        cpu = pd.to_numeric(df["cpu_usage_pct"], errors="coerce")
+        if cpu.max(skipna=True) is not None and cpu.max(skipna=True) <= 1.0:
             df["cpu_usage_pct"] = cpu * 100.0
     return df
 
 
-def _pick_target(df: pd.DataFrame, explicit: str | None) -> str:
+def _pick_target(df: pd.DataFrame, explicit: Optional[str]) -> str:
     if explicit and explicit in df.columns:
         return explicit
     for c in DEFAULT_TARGETS:
@@ -73,10 +80,7 @@ def _pick_target(df: pd.DataFrame, explicit: str | None) -> str:
     )
 
 
-def _prepare_xy(
-    df: pd.DataFrame,
-    target_col: str,
-) -> Tuple[pd.DataFrame, pd.Series]:
+def _prepare_xy(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, pd.Series]:
     missing = [f for f in CANONICAL_FEATURES if f not in df.columns]
     if missing:
         raise ValueError(f"CSV is missing required features: {missing}")
@@ -86,65 +90,91 @@ def _prepare_xy(
 
     # Coerce y to {0,1}
     if y.dtype == "O":
-        y = y.astype(str).str.lower().map({"1": 1, "true": 1, "yes": 1, "fail": 1,
-                                           "0": 0, "false": 0, "no": 0, "pass": 0})
+        y = (
+            y.astype(str)
+             .str.strip()
+             .str.lower()
+             .map({"1": 1, "true": 1, "yes": 1, "fail": 1,
+                   "0": 0, "false": 0, "no": 0, "pass": 0})
+        )
     y = y.fillna(0).astype(int).clip(0, 1)
 
-    # Some gentle sanity clipping
+    # Gentle sanitization / clipping
+    for col in CANONICAL_FEATURES:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+
     X["restart_count_last_5m"] = X["restart_count_last_5m"].clip(lower=0)
-    if "cpu_usage_pct" in X:
-        X["cpu_usage_pct"] = X["cpu_usage_pct"].clip(0, 100)
+    X["cpu_usage_pct"] = X["cpu_usage_pct"].clip(lower=0, upper=100)
+    X["ready_replica_ratio"] = X["ready_replica_ratio"].clip(lower=0, upper=1)
+
     for col in ("memory_usage_bytes", "network_receive_bytes_per_s",
                 "http_5xx_error_rate", "unavailable_replicas"):
-        if col in X:
-            X[col] = pd.to_numeric(X[col], errors="coerce").clip(lower=0)
+        X[col] = X[col].clip(lower=0)
 
     return X, y
 
 
-def _build_pipelines(num_features: List[str]) -> Dict[str, Pipeline]:
-    # Preprocess blocks
-    imputer = SimpleImputer(strategy="median")
-
-    lr_pre = Pipeline(
-        steps=[
-            ("imputer", imputer),
-            ("scaler", RobustScaler()),
-        ]
+def _preprocessor_for_linear() -> ColumnTransformer:
+    """
+    Heavy-tailed features -> log1p + RobustScaler
+    Rest -> StandardScaler
+    """
+    return ColumnTransformer(
+        transformers=[
+            ("heavy", Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("log1p", FunctionTransformer(np.log1p, feature_names_out="one-to-one")),
+                ("scaler", RobustScaler()),
+            ]), HEAVY_TAIL),
+            ("rest", Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]), REST),
+        ],
+        remainder="drop",
     )
-    gb_pre = Pipeline(
-        steps=[
-            ("imputer", imputer),
-            # no scaler for trees
-        ]
+
+
+def _preprocessor_for_trees() -> ColumnTransformer:
+    """
+    Trees don’t need scaling, but log1p helps stabilize large ranges.
+    """
+    return ColumnTransformer(
+        transformers=[
+            ("heavy", Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("log1p", FunctionTransformer(np.log1p, feature_names_out="one-to-one")),
+            ]), HEAVY_TAIL),
+            ("rest", SimpleImputer(strategy="median"), REST),
+        ],
+        remainder="drop",
     )
 
+
+def _build_base_pipelines() -> Dict[str, Pipeline]:
     lr = LogisticRegression(
-        solver="saga",
+        solver="lbfgs",  # stable for binary
         penalty="l2",
+        C=0.2,           # regularize to avoid coef blow-up
         max_iter=2000,
-        n_jobs=None,
         class_weight="balanced",
         random_state=42,
     )
     gb = GradientBoostingClassifier(random_state=42)
 
-    lr_pipe = Pipeline(
-        steps=[
-            ("prep", lr_pre),
-            ("clf", lr),
-        ]
-    )
-    gb_pipe = Pipeline(
-        steps=[
-            ("prep", gb_pre),
-            ("clf", gb),
-        ]
-    )
+    lr_pipe = Pipeline([("prep", _preprocessor_for_linear()), ("clf", lr)])
+    gb_pipe = Pipeline([("prep", _preprocessor_for_trees()), ("clf", gb)])
     return {"logreg": lr_pipe, "gboost": gb_pipe}
 
 
-def _cv_scores(model: Pipeline, X: pd.DataFrame, y: pd.Series, n_splits=5) -> Dict[str, float]:
+def _wrap_with_calibration(pipe: Pipeline, method: str) -> Pipeline | CalibratedClassifierCV:
+    if method == "none":
+        return pipe
+    # ✅ scikit-learn 1.7.0 uses `estimator=` (not `base_estimator=`)
+    return CalibratedClassifierCV(estimator=pipe, cv=5, method=method)
+
+
+def _cv_scores(model, X: pd.DataFrame, y: pd.Series, n_splits=5) -> Dict[str, float]:
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     aucs, f1s = [], []
     for tr_idx, va_idx in skf.split(X, y):
@@ -164,38 +194,20 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train failure-risk model on Prometheus features and export model.pkl"
     )
-    p.add_argument(
-        "--csv",
-        default="prom_features.csv",
-        help="Path to input CSV containing the 7 features + target column.",
-    )
-    p.add_argument(
-        "--target",
-        default=None,
-        help=f"Target column (default: first of {DEFAULT_TARGETS} found).",
-    )
-    p.add_argument(
-        "--model",
-        choices=["auto", "logreg", "gboost"],
-        default="auto",
-        help="Which model to train or 'auto' to choose the best via CV (ROC AUC).",
-    )
-    p.add_argument(
-        "--test-size",
-        type=float,
-        default=0.2,
-        help="Holdout size for final report (stratified).",
-    )
-    p.add_argument(
-        "--out-model",
-        default="ml_model/models/model.pkl",
-        help="Where to save the trained model.",
-    )
-    p.add_argument(
-        "--out-metrics",
-        default="ml_model/models/metrics.json",
-        help="Where to save training metrics JSON.",
-    )
+    p.add_argument("--csv", default="prom_features.csv",
+                   help="Path to input CSV containing the 7 features + target column.")
+    p.add_argument("--target", default=None,
+                   help=f"Target column (default: first of {DEFAULT_TARGETS} found).")
+    p.add_argument("--model", choices=["auto", "logreg", "gboost"],
+                   default="auto", help="Choose model or let CV pick best.")
+    p.add_argument("--calibration", choices=["isotonic", "sigmoid", "none"],
+                   default="isotonic", help="Probability calibration method.")
+    p.add_argument("--test-size", type=float, default=0.2,
+                   help="Holdout size for final report (stratified).")
+    p.add_argument("--out-model", default="ml_model/models/model.pkl",
+                   help="Where to save the trained model.")
+    p.add_argument("--out-metrics", default="ml_model/models/metrics.json",
+                   help="Where to save training metrics JSON.")
     return p.parse_args()
 
 
@@ -212,34 +224,37 @@ def main() -> int:
     target_col = _pick_target(df, args.target)
     X, y = _prepare_xy(df, target_col)
 
-    # Split a small holdout for a final, honest report
+    # Split a holdout for final, honest report
     Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=args.test_size, stratify=y, random_state=42
     )
 
-    pipelines = _build_pipelines(num_features=CANONICAL_FEATURES)
+    base_pipes = _build_base_pipelines()
 
-    results = {}
     if args.model in ("logreg", "gboost"):
         candidates = [args.model]
     else:
         candidates = ["logreg", "gboost"]
 
-    best_name, best_pipe, best_cv = None, None, -1.0
+    results: Dict[str, Dict[str, float]] = {}
+    best_name, best_model, best_cv = None, None, -1.0
+
     for name in candidates:
-        pipe = pipelines[name]
-        scores = _cv_scores(pipe, Xtr, ytr, n_splits=5)
+        model = _wrap_with_calibration(base_pipes[name], args.calibration)
+        scores = _cv_scores(model, Xtr, ytr, n_splits=5)
         results[name] = scores
         if scores["roc_auc_mean"] > best_cv:
-            best_name, best_pipe, best_cv = name, pipe, scores["roc_auc_mean"]
+            best_name, best_model, best_cv = name, model, scores["roc_auc_mean"]
 
     # Fit best on all training and evaluate on holdout
-    best_pipe.fit(Xtr, ytr)
-    prob = best_pipe.predict_proba(Xte)[:, 1]
+    assert best_model is not None
+    best_model.fit(Xtr, ytr)
+    prob = best_model.predict_proba(Xte)[:, 1]
     pred = (prob >= 0.5).astype(int)
 
     report = {
         "chosen_model": best_name,
+        "calibration": args.calibration,
         "cv": results.get(best_name, {}),
         "holdout": {
             "roc_auc": float(roc_auc_score(yte, prob)),
@@ -256,8 +271,7 @@ def main() -> int:
         "target": target_col,
     }
 
-    # Persist model
-    joblib.dump(best_pipe, out_model)
+    joblib.dump(best_model, out_model)
     out_metrics.write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
     print(f"Saved model to {out_model}")

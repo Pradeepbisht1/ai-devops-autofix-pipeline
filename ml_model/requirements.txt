@@ -1,6 +1,7 @@
 pandas
-scikit-learn
-joblib
+joblib==1.4.2
 flask
 gunicorn
-
+numpy==2.0.2
+scikit-learn==1.7.0
+scipy==1.14.1

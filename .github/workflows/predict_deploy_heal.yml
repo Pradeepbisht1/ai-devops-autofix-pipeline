@@ -33,12 +33,34 @@ env:
 
   RISK_THRESHOLD:      "0.70"
 
+  # === NEW: labels used to select your workload for PromQL ===
+  # If your pods have: labels: { app: backend } keep these defaults.
+  # If you use app.kubernetes.io/name, set SELECTOR_LABEL accordingly.
+  SELECTOR_LABEL:      app
+  SELECTOR_VALUE:      backend
+
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
 
     steps:
+      # Checkout (no LFS needed since you committed real model.pkl)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------- Quick model preflight (fail fast if pointer/corrupt) ----------
+      - name: Verify model artifact
+        run: |
+          python3 - <<'PY'
+          import sys, joblib
+          p='ml_model/models/model.pkl'
+          with open(p,'rb') as f:
+              head=f.read(16)
+          if head.startswith(b'version https://'):
+              print('LFS POINTER DETECTED: commit real model.pkl (no LFS)'); sys.exit(1)
+          joblib.load(p); print('MODEL_OK')
+          PY
 
       # ---------- AWS auth (OIDC role preferred) ----------
       - name: Configure AWS credentials
@@ -148,10 +170,11 @@ jobs:
         id: predict
         env:
           NS:  ${{ env.EKS_NAMESPACE }}
-          DEP: ${{ env.BACKEND_DEPLOY }}
           PROM_NS:  ${{ env.PROM_NAMESPACE }}
           PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
+          SEL_LABEL: ${{ env.SELECTOR_LABEL }}
+          SEL_VALUE: ${{ env.SELECTOR_VALUE }}
         shell: bash
         run: |
           set -euo pipefail
@@ -167,43 +190,65 @@ jobs:
 
           FEATURES=$(py <<'PY'
           import json,requests,os
-          ns=os.getenv("NS"); dep=os.getenv("DEP")
+          ns=os.getenv("NS")
+          label=os.getenv("SEL_LABEL","app")
+          val=os.getenv("SEL_VALUE","backend")
           url="http://127.0.0.1:9090/api/v1/query"
+
           def q(e):
-              r=requests.get(url,params={'query':e},timeout=10); r.raise_for_status(); return r.json()
-          def val(js):
-              try: return float(js['data']['result'][0]['value'][1])
-              except: return 0.0
-          # Selector join towards deployment
-          join = f'* on(pod,namespace) group_left(owner_kind,owner_name) kube_pod_owner{{namespace="{ns}",owner_kind="Deployment",owner_name="{dep}"}}'
-          # 7 features
-          restarts = val(q(f'sum(increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m]) {join})'))
-          cpu      = val(q(f'sum(rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m]) {join}) * 100'))
-          mem      = val(q(f'sum(container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}} {join})'))
-          des      = val(q(f'kube_deployment_spec_replicas{{namespace="{ns}",deployment="{dep}"}}'))
-          rdy      = val(q(f'kube_deployment_status_ready_replicas{{namespace="{ns}",deployment="{dep}"}}'))
-          ready_ratio = (rdy/des) if des>0 else 1.0
-          unavail  = val(q(f'kube_deployment_status_replicas_unavailable{{namespace="{ns}",deployment="{dep}"}}'))
-          net_rx   = val(q(f'sum(rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m]) {join})'))
-          # backend counter name variants
-          http5xx  = 0.0
-          for e in [
-            f'sum(rate(http_request_total{{status=~"5.."}}[2m]))/sum(rate(http_request_total[2m]))',
-            f'sum(rate(http_requests_total{{code=~"5.."}}[2m]))/sum(rate(http_requests_total[2m]))',
-            f'sum(rate(flask_http_request_total{{status=~"5.."}}[2m]))/sum(rate(flask_http_request_total[2m]))'
+              r=requests.get(url,params={'query':e},timeout=15)
+              r.raise_for_status()
+              return r.json()
+
+          def val_of(js, default=0.0):
+              try:
+                  return float(js['data']['result'][0]['value'][1])
+              except Exception:
+                  return default
+
+          # Normalize label to PromQL form: app.kubernetes.io/name -> label_app_kubernetes_io_name
+          lbl = "label_" + label.replace('.', '_').replace('/', '_')
+          L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
+
+          def sum_on_pod(expr):
+              return f'sum(({expr}) * on (namespace,pod) group_left({lbl}) ({L}))'
+
+          # Container features
+          cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
+          mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
+          net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
+          restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
+
+          # Deployment-level via deployment labels
+          dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
+          desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ready   = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ratio = (ready/desired) if desired>0 else 1.0
+
+          # HTTP 5xx fraction (generic -> flask fallback)
+          http5xx = 0.0
+          for num,den in [
+            ('http_requests_total{code=~"5.."}','http_requests_total'),
+            ('flask_http_request_total{status=~"5.."}','flask_http_request_total'),
           ]:
               try:
-                  v=val(q(e))
-                  if v>0: http5xx=v; break
-              except: pass
+                  n = val_of(q(sum_on_pod(f'rate({num}[2m])')))
+                  d = val_of(q('clamp_min('+sum_on_pod(f'rate({den}[2m])')+', 1)'))
+                  if d>0 and n/d>0:
+                      http5xx = n/d
+                      break
+              except Exception:
+                  pass
+
           feats={
-            "restart_count_last_5m":restarts,
-            "cpu_usage_pct":cpu,
-            "memory_usage_bytes":mem,
-            "ready_replica_ratio":round(ready_ratio,4),
-            "unavailable_replicas":unavail,
-            "network_receive_bytes_per_s":net_rx,
-            "http_5xx_error_rate":http5xx
+            "restart_count_last_5m": restarts,
+            "cpu_usage_pct": cpu,
+            "memory_usage_bytes": mem,
+            "ready_replica_ratio": round(ratio,4),
+            "unavailable_replicas": unavail,
+            "network_receive_bytes_per_s": net,
+            "http_5xx_error_rate": http5xx
           }
           print(json.dumps(feats))
           PY
@@ -219,20 +264,25 @@ jobs:
           RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
                 -H "Content-Type: application/json" -d "${FEATURES}")
           echo "Predict: $RESP"
-          PROB=$(echo "$RESP" | sed -n 's/.*"probability":\s*\([0-9.]*\).*/\1/p')
-          : ${PROB:=0}
+
+          PROB=$(echo "$RESP" | sed -n 's/.*"probability":\s*\([0-9.]*\).*/\1/p'); : ${PROB:=0}
+          LOADED=$(echo "$RESP" | grep -o '"model_loaded":[^,}]*' | cut -d: -f2 | tr -d ' ')
+
+          echo "fail_prob=$PROB" >> $GITHUB_OUTPUT
+          echo "model_loaded=${LOADED:-false}" >> $GITHUB_OUTPUT
+
+          # High risk only if model_loaded == true AND prob >= threshold
+          if [ "${LOADED:-false}" = "true" ] && awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}'; then
+            echo "highrisk=true"  >> $GITHUB_OUTPUT
+          else
+            echo "highrisk=false" >> $GITHUB_OUTPUT
+          fi
 
           kill $(cat /tmp/pf_backend2.pid) 2>/dev/null || true
 
-          echo "fail_prob=$PROB" >> $GITHUB_OUTPUT
-
-          awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}' \
-            && echo "highrisk=true"  >> $GITHUB_OUTPUT \
-            || echo "highrisk=false" >> $GITHUB_OUTPUT
-
       # ---------- Auto-heal (restart) if high risk ----------
       - name: Auto-heal (rollout restart)
-        if: ${{ steps.predict.outputs.highrisk == 'true' }}
+        if: ${{ steps.predict.outputs.highrisk == 'true' && steps.predict.outputs.model_loaded == 'true' }}
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout restart deployment/${BACKEND_DEPLOY}
           kubectl -n "${EKS_NAMESPACE}" rollout status  deployment/${BACKEND_DEPLOY} --timeout=5m
@@ -243,10 +293,11 @@ jobs:
         if: ${{ steps.predict.outputs.highrisk == 'true' }}
         env:
           NS:  ${{ env.EKS_NAMESPACE }}
-          DEP: ${{ env.BACKEND_DEPLOY }}
           PROM_NS:  ${{ env.PROM_NAMESPACE }}
           PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
+          SEL_LABEL: ${{ env.SELECTOR_LABEL }}
+          SEL_VALUE: ${{ env.SELECTOR_VALUE }}
         run: |
           set -euo pipefail
           sleep 60
@@ -259,38 +310,57 @@ jobs:
 
           FEATURES=$(python3 - <<'PY'
           import json,requests,os
-          ns=os.getenv("NS"); dep=os.getenv("DEP"); url="http://127.0.0.1:9090/api/v1/query"
-          def q(e): return requests.get(url,params={'query':e},timeout=10).json()
-          def val(js):
-              try: return float(js['data']['result'][0]['value'][1])
-              except: return 0.0
-          join=f'* on(pod,namespace) group_left(owner_kind,owner_name) kube_pod_owner{{namespace="{ns}",owner_kind="Deployment",owner_name="{dep}"}}'
-          restarts=val(q(f'sum(increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m]) {join})'))
-          cpu=val(q(f'sum(rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m]) {join}) * 100'))
-          mem=val(q(f'sum(container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}} {join})'))
-          des=val(q(f'kube_deployment_spec_replicas{{namespace="{ns}",deployment="{dep}"}}'))
-          rdy=val(q(f'kube_deployment_status_ready_replicas{{namespace="{ns}",deployment="{dep}"}}'))
-          ready_ratio=(rdy/des) if des>0 else 1.0
-          unavail=val(q(f'kube_deployment_status_replicas_unavailable{{namespace="{ns}",deployment="{dep}"}}'))
-          net_rx=val(q(f'sum(rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m]) {join})'))
-          http5xx=0.0
-          for e in [
-            f'sum(rate(http_request_total{{status=~"5.."}}[2m]))/sum(rate(http_request_total[2m]))',
-            f'sum(rate(http_requests_total{{code=~"5.."}}[2m]))/sum(rate(http_requests_total[2m]))',
-            f'sum(rate(flask_http_request_total{{status=~"5.."}}[2m]))/sum(rate(flask_http_request_total[2m]))'
+          ns=os.getenv("NS")
+          label=os.getenv("SEL_LABEL","app")
+          val=os.getenv("SEL_VALUE","backend")
+          url="http://127.0.0.1:9090/api/v1/query"
+
+          def q(e):
+              return requests.get(url,params={'query':e},timeout=15).json()
+          def val_of(js, default=0.0):
+              try:
+                  return float(js['data']['result'][0]['value'][1])
+              except Exception:
+                  return default
+
+          lbl = "label_" + label.replace('.', '_').replace('/', '_')
+          L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
+          def sum_on_pod(expr):
+              return f'sum(({expr}) * on (namespace,pod) group_left({lbl}) ({L}))'
+
+          cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
+          mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
+          net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
+          restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
+
+          dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
+          desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ready   = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ratio = (ready/desired) if desired>0 else 1.0
+
+          http5xx = 0.0
+          for num,den in [
+            ('http_requests_total{code=~"5.."}','http_requests_total'),
+            ('flask_http_request_total{status=~"5.."}','flask_http_request_total'),
           ]:
               try:
-                  v=val(q(e))
-                  if v>0: http5xx=v; break
-              except: pass
+                  n = val_of(q(sum_on_pod(f'rate({num}[2m])')))
+                  d = val_of(q('clamp_min('+sum_on_pod(f'rate({den}[2m])')+', 1)'))
+                  if d>0 and n/d>0:
+                      http5xx = n/d
+                      break
+              except Exception:
+                  pass
+
           print(json.dumps({
-            "restart_count_last_5m":restarts,
-            "cpu_usage_pct":cpu,
-            "memory_usage_bytes":mem,
-            "ready_replica_ratio":round(ready_ratio,4),
-            "unavailable_replicas":unavail,
-            "network_receive_bytes_per_s":net_rx,
-            "http_5xx_error_rate":http5xx
+            "restart_count_last_5m": restarts,
+            "cpu_usage_pct": cpu,
+            "memory_usage_bytes": mem,
+            "ready_replica_ratio": round(ratio,4),
+            "unavailable_replicas": unavail,
+            "network_receive_bytes_per_s": net,
+            "http_5xx_error_rate": http5xx
           }))
           PY
           )
@@ -334,7 +404,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg=" Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
+            msg="⚠️ Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' \
               | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
@@ -345,7 +415,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg=" Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
+            msg="✅ Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' \
               | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi

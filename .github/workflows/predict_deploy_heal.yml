@@ -10,32 +10,30 @@ permissions:
   contents: read
 
 env:
-  AWS_DEFAULT_REGION:  ${{ secrets.AWS_DEFAULT_REGION }}
-  AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
-  EKS_CLUSTER_NAME:    ${{ secrets.EKS_CLUSTER_NAME }}
-  EKS_NAMESPACE:       prod
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID:     ${{ secrets.AWS_ACCOUNT_ID }}
+  EKS_CLUSTER_NAME:   ${{ secrets.EKS_CLUSTER_NAME }}
+  EKS_NAMESPACE:      prod
 
   # ECR repos (two separate)
   BACKEND_REPO:        myapp
   FRONTEND_REPO:       ai-devops-frontend
 
-  # Prometheus service (verify with: kubectl -n monitoring get svc)
+  # Prometheus service
   PROM_NAMESPACE:      monitoring
   PROM_SERVICE_NAME:   prometheus-operated
 
   # K8s naming (must match your manifests)
   BACKEND_DEPLOY:      backend
   BACKEND_CONTAINER:   backend
-  BACKEND_SERVICE:     backend          # ClusterIP svc on port 5000
+  BACKEND_SERVICE:     backend
   FRONTEND_DEPLOY:     frontend
   FRONTEND_CONTAINER:  frontend
-  FRONTEND_SERVICE:    frontend         # LB/Ingress svc on port 80
+  FRONTEND_SERVICE:    frontend
 
   RISK_THRESHOLD:      "0.70"
 
-  # === Labels used to select your workload for PromQL ===
-  # If your pods have: labels: { app: backend } keep these defaults.
-  # If you use app.kubernetes.io/name, change SELECTOR_LABEL accordingly.
+  # Labels for PromQL selector
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
 
@@ -44,12 +42,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout (no LFS needed since you committed real model.pkl)
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------- Quick model preflight (no external deps) ----------
       - name: Verify model artifact (no external deps)
         run: |
           python3 - <<'PY'
@@ -67,7 +63,6 @@ jobs:
           print(f"MODEL_FILE_OK size={size} bytes")
           PY
 
-      # ---------- AWS auth (OIDC role preferred) ----------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -77,7 +72,6 @@ jobs:
       - name: Who am I?
         run: aws sts get-caller-identity
 
-      # ---------- Ensure ECR repos exist ----------
       - name: Ensure ECR repos
         run: |
           for repo in "${BACKEND_REPO}" "${FRONTEND_REPO}"; do
@@ -88,7 +82,6 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ---------- Build & push BACKEND image ----------
       - name: Build & push backend
         env:
           IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.BACKEND_REPO }}:${{ github.sha }}
@@ -98,7 +91,6 @@ jobs:
           docker push "$IMAGE_URI"
           echo "BACKEND_IMAGE=$IMAGE_URI" >> $GITHUB_ENV
 
-      # ---------- Build & push FRONTEND image ----------
       - name: Build & push frontend
         env:
           IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.FRONTEND_REPO }}:${{ github.sha }}
@@ -108,14 +100,12 @@ jobs:
           docker push "$IMAGE_URI"
           echo "FRONTEND_IMAGE=$IMAGE_URI" >> $GITHUB_ENV
 
-      # (Optional) model artifact to S3
       - name: Upload model artefact (optional)
         run: |
           if [ -f ml_model/models/model.pkl ] && [ -n "${{ secrets.MODEL_S3_PATH }}" ]; then
             aws s3 cp ml_model/models/model.pkl "${{ secrets.MODEL_S3_PATH }}"
           fi
 
-      # ---------- kubectl ----------
       - name: Install kubectl
         run: |
           curl -sSL https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
@@ -125,7 +115,6 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "${AWS_DEFAULT_REGION}" --name "${EKS_CLUSTER_NAME}"
 
-      # ---------- Apply manifests (backend, frontend, svc, ingress, hpa, servicemonitor) ----------
       - name: Apply Kubernetes manifests
         run: |
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-svc.yaml
@@ -135,47 +124,40 @@ jobs:
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/hpa-frontend.yaml || true
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/ingress.yaml || true
 
-          # Deployments (apply first, then set image to our freshly built SHAs)
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-deploy.yaml
           kubectl -n "${EKS_NAMESPACE}" set image deployment/${BACKEND_DEPLOY} ${BACKEND_CONTAINER}="${BACKEND_IMAGE}"
 
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-deploy.yaml
           kubectl -n "${EKS_NAMESPACE}" set image deployment/${FRONTEND_DEPLOY} ${FRONTEND_CONTAINER}="${FRONTEND_IMAGE}"
 
-      # ---------- Wait for rollout ----------
       - name: Wait for backend rollout
         run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m
 
       - name: Wait for frontend rollout
         run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${FRONTEND_DEPLOY} --timeout=5m
 
-      # ---------- Tooling needed for later steps ----------
       - name: Install jq and Python deps
         run: |
           sudo apt-get update && sudo apt-get install -y jq
           python3 -m pip install --upgrade pip
           python3 -m pip install requests
 
-      # ---------- Warm-up backend (optional) ----------
       - name: Warm-up backend for real metrics
         run: |
-          # Port-forward backend service (5000)
           kubectl -n "${EKS_NAMESPACE}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend.log 2>&1 &
           echo $! > /tmp/pf_backend.pid
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz && break || sleep 1; done
-          # 300 quick hits to generate CPU/Net
           for i in {1..300}; do
             curl -s -m 2 http://127.0.0.1:5000/predict -H 'Content-Type: application/json' \
               --data '{"restart_count_last_5m":0,"cpu_usage_pct":10,"memory_usage_bytes":5e7,"ready_replica_ratio":1,"unavailable_replicas":0,"network_receive_bytes_per_s":0,"http_5xx_error_rate":0}' >/dev/null || true
           done
           kill $(cat /tmp/pf_backend.pid) 2>/dev/null || true
 
-      # ---------- Query Prometheus (7 features) & call /predict ----------
       - name: Predict from runtime metrics
         id: predict
         env:
-          NS:  ${{ env.EKS_NAMESPACE }}
-          PROM_NS:  ${{ env.PROM_NAMESPACE }}
+          NS:      ${{ env.EKS_NAMESPACE }}
+          PROM_NS: ${{ env.PROM_NAMESPACE }}
           PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
           SEL_LABEL: ${{ env.SELECTOR_LABEL }}
@@ -184,7 +166,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # PF Prometheus
           kubectl -n "$PROM_NS" get svc "$PROM_SVC" -o name
           kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom.log 2>&1 &
           echo $! > /tmp/pf_prom.pid
@@ -211,27 +192,23 @@ jobs:
               except Exception:
                   return default
 
-          # Normalize label to PromQL form: app.kubernetes.io/name -> label_app_kubernetes_io_name
           lbl = "label_" + label.replace('.', '_').replace('/', '_')
           L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
 
           def sum_on_pod(expr):
               return f'sum(({expr}) * on (namespace,pod) group_left({lbl}) ({L}))'
 
-          # Container features
           cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
           mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
           net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
           restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
 
-          # Deployment-level via deployment labels
           dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
           desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
           ready   = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
           unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
           ratio = (ready/desired) if desired>0 else 1.0
 
-          # HTTP 5xx fraction (generic -> flask fallback)
           http5xx = 0.0
           for num,den in [
             ('http_requests_total{code=~"5.."}','http_requests_total'),
@@ -261,7 +238,6 @@ jobs:
 
           echo "Features: $FEATURES"
 
-          # Call backend /predict via PF (service, not deployment)
           kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend2.log 2>&1 &
           echo $! > /tmp/pf_backend2.pid
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
@@ -276,7 +252,6 @@ jobs:
           echo "fail_prob=$PROB" >> $GITHUB_OUTPUT
           echo "model_loaded=${LOADED:-false}" >> $GITHUB_OUTPUT
 
-          # High risk only if model_loaded == true AND prob >= threshold
           if [ "${LOADED:-false}" = "true" ] && awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}'; then
             echo "highrisk=true"  >> $GITHUB_OUTPUT
           else
@@ -285,21 +260,19 @@ jobs:
 
           kill $(cat /tmp/pf_backend2.pid) 2>/dev/null || true
 
-      # ---------- Auto-heal (restart) if high risk ----------
       - name: Auto-heal (rollout restart)
         if: ${{ steps.predict.outputs.highrisk == 'true' && steps.predict.outputs.model_loaded == 'true' }}
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout restart deployment/${BACKEND_DEPLOY}
-          kubectl -n "${EKS_NAMESPACE}" rollout status  deployment/${BACKEND_DEPLOY} --timeout=5m
+          kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m
 
-      # ---------- Re-check after heal; rollback if still high ----------
       - name: Re-check risk after heal
         id: recheck
         if: ${{ steps.predict.outputs.highrisk == 'true' }}
         env:
-          NS:  ${{ env.EKS_NAMESPACE }}
-          PROM_NS:  ${{ env.PROM_NAMESPACE }}
-          PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
+          NS:        ${{ env.EKS_NAMESPACE }}
+          PROM_NS:   ${{ env.PROM_NAMESPACE }}
+          PROM_SVC:  ${{ env.PROM_SERVICE_NAME }}
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
           SEL_LABEL: ${{ env.SELECTOR_LABEL }}
           SEL_VALUE: ${{ env.SELECTOR_VALUE }}
@@ -307,7 +280,6 @@ jobs:
           set -euo pipefail
           sleep 60
 
-          # PF prom
           kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom2.log 2>&1 &
           echo $! > /tmp/pf_prom2.pid
           trap 'kill $(cat /tmp/pf_prom2.pid) 2>/dev/null || true' EXIT
@@ -370,7 +342,6 @@ jobs:
           PY
           )
 
-          # call /predict again (service, not deployment)
           kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend3.log 2>&1 &
           echo $! > /tmp/pf_backend3.pid
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
@@ -391,7 +362,6 @@ jobs:
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout undo deployment/${BACKEND_DEPLOY}
 
-      # ---------- Slack notifications ----------
       - name: Slack alert (high → healed)
         if: ${{ steps.predict.outputs.highrisk == 'true' && steps.recheck.outputs.still_high != 'true' }}
         env:
@@ -399,8 +369,7 @@ jobs:
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
             msg="⚠️ High risk (p=${{ steps.predict.outputs.fail_prob }}) on ${BACKEND_DEPLOY}. Auto-heal applied."
-            printf '%s\n' "$msg" | jq -Rs '{text: .}' \
-              | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+            printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 
       - name: Slack alert (rolled back)
@@ -410,8 +379,7 @@ jobs:
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
             msg="⚠️ Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
-            printf '%s\n' "$msg" | jq -Rs '{text: .}' \
-              | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+            printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 
       - name: Slack success (kept)
@@ -421,6 +389,5 @@ jobs:
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
             msg="✅ Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
-            printf '%s\n' "$msg" | jq -Rs '{text: .}' \
-              | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+            printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi

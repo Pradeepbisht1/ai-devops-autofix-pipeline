@@ -33,9 +33,9 @@ env:
 
   RISK_THRESHOLD:      "0.70"
 
-  # === NEW: labels used to select your workload for PromQL ===
+  # === Labels used to select your workload for PromQL ===
   # If your pods have: labels: { app: backend } keep these defaults.
-  # If you use app.kubernetes.io/name, set SELECTOR_LABEL accordingly.
+  # If you use app.kubernetes.io/name, change SELECTOR_LABEL accordingly.
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
 
@@ -49,17 +49,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ---------- Quick model preflight (fail fast if pointer/corrupt) ----------
-      - name: Verify model artifact
+      # ---------- Quick model preflight (no external deps) ----------
+      - name: Verify model artifact (no external deps)
         run: |
           python3 - <<'PY'
-          import sys, joblib
+          import os, sys
           p='ml_model/models/model.pkl'
+          if not os.path.exists(p):
+              print(f"Missing model file: {p}"); sys.exit(1)
+          size = os.path.getsize(p)
           with open(p,'rb') as f:
-              head=f.read(16)
+              head=f.read(32)
           if head.startswith(b'version https://'):
-              print('LFS POINTER DETECTED: commit real model.pkl (no LFS)'); sys.exit(1)
-          joblib.load(p); print('MODEL_OK')
+              print("LFS POINTER DETECTED: commit real model.pkl (no LFS)"); sys.exit(1)
+          if size < 1024:
+              print(f"Model file too small/suspicious: {size} bytes"); sys.exit(1)
+          print(f"MODEL_FILE_OK size={size} bytes")
           PY
 
       # ---------- AWS auth (OIDC role preferred) ----------

@@ -1,4 +1,5 @@
-kube-state-metrics:
+kubeStateMetrics:
+  enabled: true
   metricAllowlist:
     - kube_pod_labels
     - kube_pod_info

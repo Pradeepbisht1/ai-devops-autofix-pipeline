@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gha-kube-system-reader
+  namespace: kube-system
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gha-kube-system-reader-rb
+  namespace: kube-system
+subjects:
+- kind: User
+  name: gha
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: gha-kube-system-reader
+  apiGroup: rbac.authorization.k8s.io

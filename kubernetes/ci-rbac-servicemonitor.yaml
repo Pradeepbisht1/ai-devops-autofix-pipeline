@@ -21,3 +21,4 @@ roleRef:
   kind: Role
   name: gha-servicemonitor-access
   apiGroup: rbac.authorization.k8s.io
+  

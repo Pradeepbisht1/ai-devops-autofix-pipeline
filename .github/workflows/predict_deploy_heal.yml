@@ -128,14 +128,9 @@ jobs:
 
       - name: Helm Upgrade Prometheus
         run: |
-         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-         helm repo update
-         helm upgrade prometheus prometheus-community/kube-prometheus-stack \
-         --reuse-values \
-         -f charts/kube-prom-stack-values.yaml \
-         --namespace monitoring \
-         --kube-token ${{ secrets.K8S_TOKEN }} \
-         --kube-apiserver ${{ secrets.K8S_SERVER }}
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade prometheus prometheus-community/kube-prometheus-stack --reuse-values -f charts/kube-prom-stack-values.yaml --namespace monitoring --kube-token ${{ secrets.K8S_TOKEN }} --kube-apiserver ${{ secrets.K8S_SERVER }}
 
       - name: Wait for backend rollout
         run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m

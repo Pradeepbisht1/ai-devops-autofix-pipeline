@@ -1,10 +1,11 @@
+# In kubernetes/backend-servicemonitor.yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: backend
   namespace: prod
   labels:
-    release: kube-prometheus-stack     # MATCH WITH YOUR  Helm release match
+    release: prometheus
 spec:
   selector:
     matchLabels: { app: backend }

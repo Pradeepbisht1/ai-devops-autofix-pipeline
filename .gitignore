@@ -52,3 +52,4 @@ Thumbs.db
 ########## 7. Git LFS #########################################################
 .gitattributes           # tracked automatically when you ran `git lfs track`
 ###############################################################################
+fetch_features.sh

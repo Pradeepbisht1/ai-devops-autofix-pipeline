@@ -299,6 +299,7 @@ PY
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
           SEL_LABEL: ${{ env.SELECTOR_LABEL }}
           SEL_VALUE: ${{ env.SELECTOR_VALUE }}
+        shell: bash
         run: |
           set -euo pipefail
           sleep 60

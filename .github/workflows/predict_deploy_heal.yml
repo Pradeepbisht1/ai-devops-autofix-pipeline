@@ -126,20 +126,6 @@ jobs:
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-deploy.yaml
           kubectl -n "${EKS_NAMESPACE}" set image deployment/${FRONTEND_DEPLOY} ${FRONTEND_CONTAINER}="${FRONTEND_IMAGE}"
 
-      - name: Helm Upgrade Prometheus
-        env:
-          K8S_TOKEN: ${{ secrets.K8S_TOKEN }}
-          K8S_SERVER: ${{ secrets.K8S_SERVER }}
-        run: |
-         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-         helm repo update
-         helm upgrade prometheus prometheus-community/kube-prometheus-stack \
-           --reuse-values \
-           -f charts/kube-prom-stack-values.yaml \
-           --namespace monitoring \
-           --kube-token $K8S_TOKEN \
-           --kube-apiserver $K8S_SERVER
-
       - name: Wait for backend rollout
         run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m
 

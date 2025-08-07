@@ -15,23 +15,23 @@ env:
   EKS_CLUSTER_NAME:   ${{ secrets.EKS_CLUSTER_NAME }}
   EKS_NAMESPACE:      prod
 
-  BACKEND_REPO:       myapp
-  FRONTEND_REPO:      ai-devops-frontend
+  BACKEND_REPO:        myapp
+  FRONTEND_REPO:       ai-devops-frontend
 
-  PROM_NAMESPACE:     monitoring
-  PROM_SERVICE_NAME:  prometheus-operated
+  PROM_NAMESPACE:      monitoring
+  PROM_SERVICE_NAME:   prometheus-operated
 
-  BACKEND_DEPLOY:     backend
-  BACKEND_CONTAINER:  backend
-  BACKEND_SERVICE:    backend
-  FRONTEND_DEPLOY:    frontend
-  FRONTEND_CONTAINER: frontend
-  FRONTEND_SERVICE:   frontend
+  BACKEND_DEPLOY:      backend
+  BACKEND_CONTAINER:   backend
+  BACKEND_SERVICE:     backend
+  FRONTEND_DEPLOY:     frontend
+  FRONTEND_CONTAINER:  frontend
+  FRONTEND_SERVICE:    frontend
 
-  RISK_THRESHOLD:     "0.70"
+  RISK_THRESHOLD:      "0.70"
 
-  SELECTOR_LABEL:     app
-  SELECTOR_VALUE:     backend
+  SELECTOR_LABEL:      app
+  SELECTOR_VALUE:      backend
 
 jobs:
   build-deploy-heal:
@@ -171,92 +171,73 @@ jobs:
           py() { python3 - "$@"; }
 
           FEATURES=$(py <<'PY'
-import json, requests, os, sys
+          import json, requests, os
+          ns = os.getenv("NS")
+          label = os.getenv("SEL_LABEL", "app")
+          val = os.getenv("SEL_VALUE", "backend")
+          threshold = float(os.getenv("THRESHOLD", "0.70"))
+          url = "http://127.0.0.1:9090/api/v1/query"
 
-# --- Configuration from Environment Variables ---
-ns = os.getenv("NS", "prod")
-sel_label = os.getenv("SEL_LABEL", "app")
-sel_value = os.getenv("SEL_VALUE", "backend")
-backend_deploy = os.getenv("BACKEND_DEPLOY", "backend")
-threshold = float(os.getenv("THRESHOLD", "0.70"))
-url = "http://127.0.0.1:9090/api/v1/query"
+          def q(expr):
+              r = requests.get(url, params={"query": expr}, timeout=15)
+              r.raise_for_status()
+              return r.json()
 
-# --- Helper function to query Prometheus and handle errors ---
-def q(expr):
-    try:
-        r = requests.get(url, params={"query": expr}, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error querying Prometheus for '{expr}': {e}", file=sys.stderr)
-        return {"data": {"result": []}}
+          def val_of(js, default=0.0):
+              try:
+                  return float(js["data"]["result"][0]["value"][1])
+              except Exception:
+                  return default
 
-# --- Helper to safely extract a single value from a query result ---
-# Averages the values if multiple time series are returned (e.g., from multiple pods).
-def val_of(js, default=0.0):
-    try:
-        results = js["data"]["result"]
-        if not results:
-            return default
-        # Sum all values from the vector and average them
-        total = sum(float(r["value"][1]) for r in results)
-        return total / len(results)
-    except (IndexError, KeyError, ValueError):
-        return default
+          # Try pod-level label join first
+          lbl = "label_" + label.replace(".", "_").replace("/", "_")
+          pod_label_query = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
+          pod_labels = q(pod_label_query)
+          use_pod_join = len(pod_labels.get("data", {}).get("result", [])) > 0
 
-# --- Define Selectors ---
-# Use a label selector on metrics, which is far more reliable.
-pod_selector = f'{sel_label}="{sel_value}"'
-deployment_selector = f'deployment="{backend_deploy}"'
+          if use_pod_join:
+              L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
+              def sum_on_pod(expr):
+                  return f'sum(({expr}) * on(namespace,pod) group_left({lbl}) ({L}))'
 
-# --- Direct Metric Queries (like in fetch_features.sh) ---
-cpu_query = f'rate(container_cpu_usage_seconds_total{{namespace="{ns}", {pod_selector}}}[2m]) * 100'
-cpu = val_of(q(cpu_query))
+              cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
+              mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
+              net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
+              restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
+              dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
+              desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on(namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+              ready = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on(namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+              unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on(namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+              ratio = (ready / desired) if desired > 0 else 1.0
+          else:
+              # Fallback: deployment-level available/desired
+              cpu = mem = net = restarts = 0.0
+              desired = val_of(q(f'kube_deployment_spec_replicas{{namespace="{ns}",deployment="backend"}}'))
+              available = val_of(q(f'kube_deployment_status_replicas_available{{namespace="{ns}",deployment="backend"}}'))
+              ratio = (available / desired) if desired > 0 else 1.0
+              unavail = max(0.0, desired - available)
 
-mem_query = f'avg(container_memory_usage_bytes{{namespace="{ns}", {pod_selector}}})'
-mem = val_of(q(mem_query))
+          # HTTP 5xx fraction fallback
+          http5xx = 0.0
+          try:
+              n = val_of(q('rate(http_requests_total{code=~"5.."}[2m])'))
+              d = val_of(q('clamp_min(rate(http_requests_total[2m]),1)'))
+              if d > 0:
+                  http5xx = n / d
+          except Exception:
+              pass
 
-net_query = f'rate(container_network_receive_bytes_total{{namespace="{ns}", {pod_selector}}}[2m])'
-net = val_of(q(net_query))
-
-restarts_query = f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}", {pod_selector}}}[5m])'
-restarts = val_of(q(restarts_query), default=0) # increase() can be empty
-
-# --- Deployment Status Queries ---
-desired_query = f'kube_deployment_spec_replicas{{namespace="{ns}", {deployment_selector}}}'
-desired = val_of(q(desired_query))
-
-ready_query = f'kube_deployment_status_replicas_ready{{namespace="{ns}", {deployment_selector}}}'
-ready = val_of(q(ready_query))
-
-unavail_query = f'kube_deployment_status_replicas_unavailable{{namespace="{ns}", {deployment_selector}}}'
-unavail = val_of(q(unavail_query))
-
-ratio = (ready / desired) if desired > 0 else 1.0
-
-# --- HTTP 5xx Error Rate ---
-# This query assumes your http_server_errors_total metric is labeled with app="backend"
-http5xx = 0.0
-try:
-    # Use the pod selector to filter requests for the correct app
-    error_rate_query = f'sum(rate(http_server_errors_total{{namespace="{ns}", {pod_selector}}}[2m]))'
-    http5xx = val_of(q(error_rate_query))
-except Exception:
-    pass
-
-# --- Final JSON Output ---
-feats = {
-    "restart_count_last_5m": restarts,
-    "cpu_usage_pct": cpu,
-    "memory_usage_bytes": mem,
-    "ready_replica_ratio": round(ratio, 4),
-    "unavailable_replicas": unavail,
-    "network_receive_bytes_per_s": net,
-    "http_5xx_error_rate": http5xx,
-}
-
-print(json.dumps(feats))
-PY
+          feats = {
+              "restart_count_last_5m": restarts,
+              "cpu_usage_pct": cpu,
+              "memory_usage_bytes": mem,
+              "ready_replica_ratio": round(ratio, 4),
+              "unavailable_replicas": unavail,
+              "network_receive_bytes_per_s": net,
+              "http_5xx_error_rate": http5xx,
+          }
+          print(json.dumps(feats))
+          PY
           )
 
           echo "Features: $FEATURES"
@@ -266,7 +247,7 @@ PY
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
 
           RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                   -H "Content-Type: application/json" -d "${FEATURES}")
+                -H "Content-Type: application/json" -d "${FEATURES}")
           echo "Predict: $RESP"
 
           PROB=$(echo "$RESP" | sed -n 's/.*"probability":\s*\([0-9.]*\).*/\1/p'); : ${PROB:=0}
@@ -293,13 +274,12 @@ PY
         id: recheck
         if: ${{ steps.predict.outputs.highrisk == 'true' }}
         env:
-          NS:       ${{ env.EKS_NAMESPACE }}
-          PROM_NS:  ${{ env.PROM_NAMESPACE }}
-          PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
+          NS:        ${{ env.EKS_NAMESPACE }}
+          PROM_NS:   ${{ env.PROM_NAMESPACE }}
+          PROM_SVC:  ${{ env.PROM_SERVICE_NAME }}
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
           SEL_LABEL: ${{ env.SELECTOR_LABEL }}
           SEL_VALUE: ${{ env.SELECTOR_VALUE }}
-        shell: bash
         run: |
           set -euo pipefail
           sleep 60
@@ -310,92 +290,61 @@ PY
           for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
 
           FEATURES=$(python3 - <<'PY'
-import json, requests, os, sys
+          import json,requests,os
+          ns=os.getenv("NS")
+          label=os.getenv("SEL_LABEL","app")
+          val=os.getenv("SEL_VALUE","backend")
+          url="http://127.0.0.1:9090/api/v1/query"
 
-# --- Configuration from Environment Variables ---
-ns = os.getenv("NS", "prod")
-sel_label = os.getenv("SEL_LABEL", "app")
-sel_value = os.getenv("SEL_VALUE", "backend")
-backend_deploy = os.getenv("BACKEND_DEPLOY", "backend")
-threshold = float(os.getenv("THRESHOLD", "0.70"))
-url = "http://127.0.0.1:9090/api/v1/query"
+          def q(e):
+              return requests.get(url,params={'query':e},timeout=15).json()
+          def val_of(js, default=0.0):
+              try:
+                  return float(js['data']['result'][0]['value'][1])
+              except Exception:
+                  return default
 
-# --- Helper function to query Prometheus and handle errors ---
-def q(expr):
-    try:
-        r = requests.get(url, params={"query": expr}, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error querying Prometheus for '{expr}': {e}", file=sys.stderr)
-        return {"data": {"result": []}}
+          lbl = "label_" + label.replace('.', '_').replace('/', '_')
+          L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
+          def sum_on_pod(expr):
+              return f'sum(({expr}) * on (namespace,pod) group_left({lbl}) ({L}))'
 
-# --- Helper to safely extract a single value from a query result ---
-# Averages the values if multiple time series are returned (e.g., from multiple pods).
-def val_of(js, default=0.0):
-    try:
-        results = js["data"]["result"]
-        if not results:
-            return default
-        # Sum all values from the vector and average them
-        total = sum(float(r["value"][1]) for r in results)
-        return total / len(results)
-    except (IndexError, KeyError, ValueError):
-        return default
+          cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
+          mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
 
-# --- Define Selectors ---
-# Use a label selector on metrics, which is far more reliable.
-pod_selector = f'{sel_label}="{sel_value}"'
-deployment_selector = f'deployment="{backend_deploy}"'
+          net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
+          restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
 
-# --- Direct Metric Queries (like in fetch_features.sh) ---
-cpu_query = f'rate(container_cpu_usage_seconds_total{{namespace="{ns}", {pod_selector}}}[2m]) * 100'
-cpu = val_of(q(cpu_query))
+          dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
+          desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ready = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
+          ratio = (ready/desired) if desired>0 else 1.0
 
-mem_query = f'avg(container_memory_usage_bytes{{namespace="{ns}", {pod_selector}}})'
-mem = val_of(q(mem_query))
+          http5xx = 0.0
+          for num,den in [
+            ('http_requests_total{code=~"5.."}','http_requests_total'),
+            ('flask_http_request_total{status=~"5.."}','flask_http_request_total'),
+          ]:
+              try:
+                  n = val_of(q(sum_on_pod(f'rate({num}[2m])')))
+                  d = val_of(q('clamp_min('+sum_on_pod(f'rate({den}[2m])')+', 1)'))
+                  if d>0 and n/d>0:
+                      http5xx = n/d
+                      break
+              except Exception:
+                  pass
 
-net_query = f'rate(container_network_receive_bytes_total{{namespace="{ns}", {pod_selector}}}[2m])'
-net = val_of(q(net_query))
-
-restarts_query = f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}", {pod_selector}}}[5m])'
-restarts = val_of(q(restarts_query), default=0) # increase() can be empty
-
-# --- Deployment Status Queries ---
-desired_query = f'kube_deployment_spec_replicas{{namespace="{ns}", {deployment_selector}}}'
-desired = val_of(q(desired_query))
-
-ready_query = f'kube_deployment_status_replicas_ready{{namespace="{ns}", {deployment_selector}}}'
-ready = val_of(q(ready_query))
-
-unavail_query = f'kube_deployment_status_replicas_unavailable{{namespace="{ns}", {deployment_selector}}}'
-unavail = val_of(q(unavail_query))
-
-ratio = (ready / desired) if desired > 0 else 1.0
-
-# --- HTTP 5xx Error Rate ---
-# This query assumes your http_server_errors_total metric is labeled with app="backend"
-http5xx = 0.0
-try:
-    # Use the pod selector to filter requests for the correct app
-    error_rate_query = f'sum(rate(http_server_errors_total{{namespace="{ns}", {pod_selector}}}[2m]))'
-    http5xx = val_of(q(error_rate_query))
-except Exception:
-    pass
-
-# --- Final JSON Output ---
-feats = {
-    "restart_count_last_5m": restarts,
-    "cpu_usage_pct": cpu,
-    "memory_usage_bytes": mem,
-    "ready_replica_ratio": round(ratio, 4),
-    "unavailable_replicas": unavail,
-    "network_receive_bytes_per_s": net,
-    "http_5xx_error_rate": http5xx,
-}
-
-print(json.dumps(feats))
-PY
+          print(json.dumps({
+            "restart_count_last_5m": restarts,
+            "cpu_usage_pct": cpu,
+            "memory_usage_bytes": mem,
+            "ready_replica_ratio": round(ratio,4),
+            "unavailable_replicas": unavail,
+            "network_receive_bytes_per_s": net,
+            "http_5xx_error_rate": http5xx
+          }))
+          PY
           )
 
           kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend3.log 2>&1 &
@@ -403,7 +352,7 @@ PY
           for i in {1..60}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 1; done
 
           RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                   -H "Content-Type: application/json" -d "${FEATURES}")
+                -H "Content-Type: application/json" -d "${FEATURES}")
           PROB=$(echo "$RESP" | sed -n 's/.*"probability":\s*\([0-9.]*\).*/\1/p'); : ${PROB:=0}
           echo "fail_prob2=$PROB" >> $GITHUB_OUTPUT
 

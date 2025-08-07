@@ -32,6 +32,7 @@ env:
 
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
+  DISABLE_RATE_LIMIT:  true
 
 jobs:
   build-deploy-heal:

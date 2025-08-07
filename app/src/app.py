@@ -130,18 +130,24 @@ def _predict_probability(f: Dict[str, float]) -> float:
 
 # ───────────────────── Simple in-mem rate-limit ────────────────
 REQUEST_COUNTS: Dict[str, int] = {}
+
 def rate_limit(limit: int = Config.RATE_LIMIT):
     def deco(f):
         @wraps(f)
         def wrapped(*a, **kw):
+            # Skip rate limit in CI or test env
+            if os.getenv("DISABLE_RATE_LIMIT", "false").lower() == "true":
+                return f(*a, **kw)
+
             ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
-            REQUEST_COUNTS[ip] = REQUEST_COUNTS.get(ip, 0)+1
+            REQUEST_COUNTS[ip] = REQUEST_COUNTS.get(ip, 0) + 1
             if REQUEST_COUNTS[ip] > limit:
                 HTTP_REQS.labels(method=request.method, status="429").inc()
                 return jsonify({"ok": False, "error": "rate limit exceeded"}), 429
             return f(*a, **kw)
         return wrapped
     return deco
+
 
 # ────────────────────────── Routes ─────────────────────────────
 @app.get("/")

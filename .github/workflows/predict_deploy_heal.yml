@@ -33,18 +33,19 @@ env:
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
   DISABLE_RATE_LIMIT:  true
-  METRICS_WAIT_TIME:   120  # Added metrics collection timeout
+  METRICS_WAIT_TIME:   120
 
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Verify model artifact (no external deps)
+      - name: Verify model artifact
         run: |
           python3 - <<'PY'
           import os, sys
@@ -98,7 +99,7 @@ jobs:
           docker push "$IMAGE_URI"
           echo "FRONTEND_IMAGE=$IMAGE_URI" >> $GITHUB_ENV
 
-      - name: Upload model artefact (optional)
+      - name: Upload model artefact
         run: |
           if [ -f ml_model/models/model.pkl ] && [ -n "${{ secrets.MODEL_S3_PATH }}" ]; then
             aws s3 cp ml_model/models/model.pkl "${{ secrets.MODEL_S3_PATH }}"
@@ -128,19 +129,13 @@ jobs:
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-deploy.yaml
           kubectl -n "${EKS_NAMESPACE}" set image deployment/${FRONTEND_DEPLOY} ${FRONTEND_CONTAINER}="${FRONTEND_IMAGE}"
 
-      - name: Verify scrape interval
+      - name: Verify ServiceMonitor
         run: |
           echo "ServiceMonitor configuration:"
           kubectl -n "${EKS_NAMESPACE}" get servicemonitor backend -o yaml | grep -A 2 endpoints
-          
-          echo "Prometheus config:"
-          kubectl -n monitoring exec prometheus-prometheus-kube-prometheus-prometheus-0 -- \
-            cat /etc/prometheus/config_out/prometheus.env.yaml | \
-            grep -A 5 "job_name: .*prod/backend"
 
       - name: Generate sustained traffic
         run: |
-          # Create dedicated load generator deployment
           kubectl apply -n "${EKS_NAMESPACE}" -f - <<EOF
           apiVersion: apps/v1
           kind: Deployment
@@ -172,9 +167,10 @@ jobs:
                   requests:
                     cpu: 10m
                     memory: 32Mi
+                  limits:
+                    cpu: 100m
           EOF
           
-          # Wait for load generator to start
           kubectl -n "${EKS_NAMESPACE}" wait --for=condition=available deploy/loadgen --timeout=60s
 
       - name: Wait for backend rollout
@@ -185,7 +181,6 @@ jobs:
 
       - name: Verify metrics scraping
         run: |
-          # Wait for Prometheus to discover targets
           sleep 30
           
           # Start port-forward to Prometheus
@@ -202,10 +197,9 @@ jobs:
             exit 1
           fi
           
-          # Cleanup port-forward
           kill $PF_PID
 
-      - name: Install jq and Python deps
+      - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y jq
           python3 -m pip install --upgrade pip
@@ -220,7 +214,7 @@ jobs:
           THRESHOLD: ${{ env.RISK_THRESHOLD }}
           SEL_LABEL: ${{ env.SELECTOR_LABEL }}
           SEL_VALUE: ${{ env.SELECTOR_VALUE }}
-          RETRY_COUNT: 5  # Added retry configuration
+          RETRY_COUNT: 5
         shell: bash
         run: |
           set -euo pipefail
@@ -251,7 +245,6 @@ jobs:
                   --data-urlencode "query=$query" \
                   -H "Accept: application/json")
                 
-                # Validate we got numeric results
                 if echo "$result" | jq -e '.data.result[0].value[1] | tonumber? // empty' >/dev/null; then
                   echo "$result"
                   return 0
@@ -336,10 +329,17 @@ jobs:
           trap "kill $BACKEND_PID 2>/dev/null || true" EXIT
           for i in {1..30}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 2; done
 
-          RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                -H "Content-Type: application/json" -d "${features}")
+          # Add retry logic for prediction request
+          max_retries=3
+          retry_count=0
+          while [ $retry_count -lt $max_retries ]; do
+            RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
+                   -H "Content-Type: application/json" -d "${features}") && break
+            retry_count=$((retry_count+1))
+            sleep 5
+          done
+          
           echo "Predict: $RESP"
-
           PROB=$(echo "$RESP" | jq -r '.probability // 0')
           LOADED=$(echo "$RESP" | jq -r '.model_loaded // false')
 
@@ -370,7 +370,7 @@ jobs:
           SEL_VALUE: ${{ env.SELECTOR_VALUE }}
         run: |
           set -euo pipefail
-          sleep 60
+          sleep 120  # Increased from 60s for metrics stabilization
 
           kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom2.log 2>&1 &
           PROM_PID=$!
@@ -415,7 +415,7 @@ jobs:
             ('flask_http_request_total{status=~"5.."}','flask_http_request_total'),
           ]:
               try:
-                  n = val_of(q(sum_on_pod(f'rate({num}[2m])')))
+                  n = val_of(q(sum_on_pod(f'rate({num}[2m])'))
                   d = val_of(q('clamp_min('+sum_on_pod(f'rate({den}[2m])')+', 1)'))
                   if d>0 and n/d>0:
                       http5xx = n/d
@@ -440,8 +440,16 @@ jobs:
           trap "kill $BACKEND_PID 2>/dev/null || true" EXIT
           for i in {1..30}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 2; done
 
-          RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                -H "Content-Type: application/json" -d "${FEATURES}")
+          # Add retry logic for prediction request
+          max_retries=3
+          retry_count=0
+          while [ $retry_count -lt $max_retries ]; do
+            RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
+                   -H "Content-Type: application/json" -d "${FEATURES}") && break
+            retry_count=$((retry_count+1))
+            sleep 5
+          done
+          
           PROB=$(echo "$RESP" | jq -r '.probability // 0')
           echo "fail_prob2=$PROB" >> $GITHUB_OUTPUT
 
@@ -484,7 +492,7 @@ jobs:
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
       
-      - name: Cleanup traffic generator
+      - name: Cleanup resources
         if: always()
         run: |
           kubectl -n "${EKS_NAMESPACE}" delete deployment/loadgen --ignore-not-found

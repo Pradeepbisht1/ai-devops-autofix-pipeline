@@ -32,7 +32,8 @@ env:
   FRONTEND_CONTAINER:  frontend
   FRONTEND_SERVICE:    frontend
 
-  RISK_THRESHOLD:      "0.50"
+  
+  RISK_THRESHOLD:      "0.70"
 
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
@@ -284,7 +285,7 @@ jobs:
           done
 
           if [ $attempt -gt $max_attempts ]; then
-            echo " All metric queries returned zero after $max_attempts attempts"
+            echo "❌ All metric queries returned zero after $max_attempts attempts"
             exit 1
           fi
 
@@ -312,11 +313,18 @@ jobs:
             && echo "highrisk=true"  >> $GITHUB_OUTPUT \
             || echo "highrisk=false" >> $GITHUB_OUTPUT
 
-      - name: Auto-heal (rollout restart)
+      - name: Auto-heal (smart script)
         if: ${{ steps.predict.outputs.highrisk == 'true' && steps.predict.outputs.model_loaded == 'true' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          kubectl -n "${EKS_NAMESPACE}" rollout restart deployment/${BACKEND_DEPLOY}
-          kubectl -n "${EKS_NAMESPACE}" rollout status  deployment/${BACKEND_DEPLOY} --timeout=5m
+          set -e
+          chmod +x pipeline/scripts/smart_auto_heal.py
+          python3 -m pip install --user requests
+          pipeline/scripts/smart_auto_heal.py \
+            --deployment "${BACKEND_DEPLOY}" \
+            --namespace "${EKS_NAMESPACE}" \
+            --replicas 2
 
       - name: Re-check risk after heal
         id: recheck
@@ -368,6 +376,8 @@ jobs:
         if: ${{ steps.recheck.outputs.still_high == 'true' }}
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout undo deployment/${BACKEND_DEPLOY}
+          # reset heal-attempt annotation so next run starts fresh
+          kubectl -n "${EKS_NAMESPACE}" annotate deployment/${BACKEND_DEPLOY} healing.attempt- || true
 
       - name: Slack alert (high → healed)
         if: ${{ steps.predict.outputs.highrisk == 'true' && steps.recheck.outputs.still_high != 'true' }}
@@ -375,7 +385,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg=" High risk (p=${{ steps.predict.outputs.fail_prob }}) on ${BACKEND_DEPLOY}. Auto-heal applied."
+            msg=" High risk (p=${{ steps.predict.outputs.fail_prob }}) on ${BACKEND_DEPLOY}. Auto-heal applied and risk reduced."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 
@@ -385,7 +395,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg="⚠️ Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
+            msg="Risk persisted (p=${{ steps.recheck.outputs.fail_prob2 }}) → rolled back ${BACKEND_DEPLOY}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 

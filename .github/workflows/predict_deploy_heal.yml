@@ -33,7 +33,7 @@ env:
   FRONTEND_SERVICE:    frontend
 
   
-  RISK_THRESHOLD:      "0.50"
+  RISK_THRESHOLD:      "0.70"
 
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend

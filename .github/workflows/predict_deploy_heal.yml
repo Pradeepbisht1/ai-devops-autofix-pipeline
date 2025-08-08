@@ -32,7 +32,7 @@ env:
   FRONTEND_CONTAINER:  frontend
   FRONTEND_SERVICE:    frontend
 
-  RISK_THRESHOLD:      "0.70"
+  RISK_THRESHOLD:      "0.50"
 
   SELECTOR_LABEL:      app
   SELECTOR_VALUE:      backend
@@ -199,8 +199,8 @@ jobs:
           Q='up{namespace="'${EKS_NAMESPACE}'"}'
           RES="$(curl -sG 'http://127.0.0.1:9090/api/v1/query' --data-urlencode "query=$Q")"
           echo "$RES" | jq -e '.status=="success" and (.data.result|length>0)' >/dev/null \
-            && echo "✅ Prometheus is scraping targets in ${EKS_NAMESPACE}" \
-            || (echo "❌ Prometheus scrape not confirmed"; tail -n 100 /tmp/pf-prom.log; exit 1)
+            && echo " Prometheus is scraping targets in ${EKS_NAMESPACE}" \
+            || (echo " Prometheus scrape not confirmed"; tail -n 100 /tmp/pf-prom.log; exit 1)
 
       - name: Predict from runtime metrics
         id: predict
@@ -272,11 +272,11 @@ jobs:
             echo "Features: $features"
 
             if jq -e '.[] | select(. > 0)' <<< "$features" >/dev/null; then
-              echo "✅ Valid metrics obtained"
+              echo " Valid metrics obtained"
               stop_pf
               break
             else
-              echo "⚠️ All metrics zero - retrying in 20s"
+              echo " All metrics zero - retrying in 20s"
               stop_pf
               sleep 20
               ((attempt++))
@@ -284,7 +284,7 @@ jobs:
           done
 
           if [ $attempt -gt $max_attempts ]; then
-            echo "❌ All metric queries returned zero after $max_attempts attempts"
+            echo " All metric queries returned zero after $max_attempts attempts"
             exit 1
           fi
 
@@ -375,7 +375,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg="⚠️ High risk (p=${{ steps.predict.outputs.fail_prob }}) on ${BACKEND_DEPLOY}. Auto-heal applied."
+            msg=" High risk (p=${{ steps.predict.outputs.fail_prob }}) on ${BACKEND_DEPLOY}. Auto-heal applied."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 
@@ -395,7 +395,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            msg="✅ Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
+            msg=" Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
 

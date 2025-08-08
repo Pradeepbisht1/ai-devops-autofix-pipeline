@@ -251,7 +251,7 @@ File: `.github/workflows/ci.yml` (name: **Predict, Deploy & Auto‑Heal Pipeline
 6. Deploy a small **loadgen** to keep traffic flowing
 7. **Port‑forward Prometheus**, query metrics → build features JSON
 8. Port‑forward **backend** and call `/predict`
-9. If **probability ≥ `RISK_THRESHOLD`** (default **0.50**): trigger **auto‑healing**
+9. If **probability ≥ `RISK_THRESHOLD`** (default **0.70**): trigger **auto‑healing**
 10. Re‑check risk after **120s**:
     - If still high → **rollback**
     - Else → keep rollout

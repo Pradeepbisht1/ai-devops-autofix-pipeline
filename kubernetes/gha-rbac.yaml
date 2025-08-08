@@ -1,32 +1,31 @@
 # kubernetes/gha-rbac.yaml (APP NAMESPACE)
-# Update: added pods/log, pods/exec, pods/status for richer debug access.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: gh-actions-app-access
-  namespace: prod  # <-- set to your $NS (prod in your repo)
+  namespace: prod
 rules:
-  # Deployments & ReplicaSets (set image, rollout status/undo)
+  # Deployments & scaling
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
+    resources: ["deployments", "deployments/scale", "replicasets"]
     verbs: ["get", "list", "watch", "update", "patch", "create"]
 
-  # Services/Endpoints (for apply + port-forward svc)
+  # Services/Endpoints (apply + port-forward svc)
   - apiGroups: [""]
     resources: ["services", "endpoints"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
 
-  # Pods + logs/exec/status (read & watch)
+  # Pods + logs/status (read)
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/exec", "pods/status"]
+    resources: ["pods", "pods/log", "pods/status"]
     verbs: ["get", "list", "watch"]
 
-  # Port‑forward to Service resolves to a Pod; allow the subresource
+  # Exec & port-forward require "create" on subresources
   - apiGroups: [""]
-    resources: ["pods/portforward"]
+    resources: ["pods/exec", "pods/portforward"]
     verbs: ["create"]
 
-  # (Optional) Events for better debugging
+  # Optional: events
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch"]
@@ -36,10 +35,15 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: gh-actions-app-access-rb
-  namespace: prod  # <-- set to your $NS
+  namespace: prod
 subjects:
+  # keep your group if you use it
   - kind: Group
-    name: gh-actions-deployer  # mapped in aws-auth
+    name: gh-actions-deployer
+    apiGroup: rbac.authorization.k8s.io
+  # also bind the exact user the cluster sees ("gha")
+  - kind: User
+    name: gha
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role

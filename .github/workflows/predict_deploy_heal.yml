@@ -5,6 +5,10 @@ on:
   push:
     branches: ['main']
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   id-token: write
   contents: read
@@ -38,7 +42,7 @@ env:
 jobs:
   build-deploy-heal:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -99,23 +103,30 @@ jobs:
           docker push "$IMAGE_URI"
           echo "FRONTEND_IMAGE=$IMAGE_URI" >> $GITHUB_ENV
 
-      - name: Upload model artefact
+      - name: Upload model artifact (optional)
         run: |
           if [ -f ml_model/models/model.pkl ] && [ -n "${{ secrets.MODEL_S3_PATH }}" ]; then
             aws s3 cp ml_model/models/model.pkl "${{ secrets.MODEL_S3_PATH }}"
           fi
 
-      - name: Install kubectl
+      - name: Install kubectl (pinned)
         run: |
-          curl -sSL https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin
+          set -e
+          KUBECTL_VERSION=v1.29.6
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
 
       - name: Configure kubeconfig
         run: |
           aws eks update-kubeconfig --region "${AWS_DEFAULT_REGION}" --name "${EKS_CLUSTER_NAME}"
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Apply Kubernetes manifests
         run: |
+          set -euo pipefail
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-svc.yaml
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-svc.yaml
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/backend-servicemonitor.yaml || true
@@ -129,14 +140,21 @@ jobs:
           kubectl -n "${EKS_NAMESPACE}" apply -f kubernetes/frontend-deploy.yaml
           kubectl -n "${EKS_NAMESPACE}" set image deployment/${FRONTEND_DEPLOY} ${FRONTEND_CONTAINER}="${FRONTEND_IMAGE}"
 
+      - name: Wait for rollouts
+        run: |
+          set -e
+          kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY}  --timeout=5m
+          kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${FRONTEND_DEPLOY} --timeout=5m
+
       - name: Verify ServiceMonitor
         run: |
           echo "ServiceMonitor configuration:"
-          kubectl -n "${EKS_NAMESPACE}" get servicemonitor backend -o yaml | grep -A 2 endpoints
+          kubectl -n "${EKS_NAMESPACE}" get servicemonitor backend -o yaml | grep -A 2 endpoints || true
 
       - name: Generate sustained traffic
         run: |
-          kubectl apply -n "${EKS_NAMESPACE}" -f - <<EOF
+          set -euo pipefail
+          kubectl apply -n "${EKS_NAMESPACE}" -f - <<'EOF'
           apiVersion: apps/v1
           kind: Deployment
           metadata:
@@ -144,315 +162,204 @@ jobs:
           spec:
             replicas: 1
             selector:
-              matchLabels:
-                app: loadgen
+              matchLabels: { app: loadgen }
             template:
-              metadata:
-                labels:
-                  app: loadgen
+              metadata: { labels: { app: loadgen } }
               spec:
                 containers:
                 - name: main
-                  image: nicolaka/netshoot
-                  command: ["/bin/sh", "-c"]
+                  image: curlimages/curl:8.11.1
+                  command: ["/bin/sh","-c"]
                   args:
                     - >
                       while true; do
-                        curl -s "http://backend:5000/healthz";
-                        curl -s "http://backend:5000/predict" -H 'Content-Type: application/json' \
-                          -d '{"features": [0,10,50000000,1,0,0,0]}';
+                        curl -s "http://backend:5000/healthz" >/dev/null || true;
+                        curl -s "http://backend:5000/predict" -H 'Content-Type: application/json'
+                        -d '{"features":[0,10,52428800,1,0,0,0]}' >/dev/null || true;
                         sleep 0.2;
                       done
-                resources:
-                  requests:
-                    cpu: 10m
-                    memory: 32Mi
-                  limits:
-                    cpu: 100m
+                  resources:
+                    requests: { cpu: 10m, memory: 32Mi }
+                    limits:   { cpu: 100m, memory: 64Mi }
           EOF
-          
           kubectl -n "${EKS_NAMESPACE}" wait --for=condition=available deploy/loadgen --timeout=60s
 
-      - name: Wait for backend rollout
-        run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m
-
-      - name: Wait for frontend rollout
-        run: kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${FRONTEND_DEPLOY} --timeout=5m
-
-      - name: Verify metrics scraping
+      - name: Verify metrics scraping (Prometheus via port-forward)
         run: |
-          sleep 30
-          
-          # Start port-forward to Prometheus
-          kubectl -n monitoring port-forward svc/prometheus-operated 9090:9090 >/dev/null &
+          set -euo pipefail
+          kubectl -n "${PROM_NAMESPACE}" get svc "${PROM_SERVICE_NAME}" -o name
+
+          kubectl -n "${PROM_NAMESPACE}" port-forward svc/"${PROM_SERVICE_NAME}" 9090:9090 >/tmp/pf-prom.log 2>&1 &
           PF_PID=$!
-          sleep 5
-          
-          # Check if backend is being scraped
-          if curl -s "http://localhost:9090/api/v1/targets" | \
-             jq -e '.data.activeTargets[] | select(.scrapePool | contains("prod/backend"))' >/dev/null; then
-            echo "✅ Backend is being scraped by Prometheus"
-          else
-            echo "❌ Backend not found in Prometheus targets"
-            exit 1
-          fi
-          
-          kill $PF_PID
+          cleanup() { kill $PF_PID 2>/dev/null || true; }
+          trap cleanup EXIT
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq
-          python3 -m pip install --upgrade pip
-          python3 -m pip install requests prometheus-api-client
+          for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
+
+          Q='up{namespace="'${EKS_NAMESPACE}'"}'
+          RES="$(curl -sG 'http://127.0.0.1:9090/api/v1/query' --data-urlencode "query=$Q")"
+          echo "$RES" | jq -e '.status=="success" and (.data.result|length>0)' >/dev/null \
+            && echo "✅ Prometheus is scraping targets in ${EKS_NAMESPACE}" \
+            || (echo "❌ Prometheus scrape not confirmed"; tail -n 100 /tmp/pf-prom.log; exit 1)
 
       - name: Predict from runtime metrics
         id: predict
         env:
-          NS:       ${{ env.EKS_NAMESPACE }}
-          PROM_NS:  ${{ env.PROM_NAMESPACE }}
-          PROM_SVC: ${{ env.PROM_SERVICE_NAME }}
-          THRESHOLD: ${{ env.RISK_THRESHOLD }}
-          SEL_LABEL: ${{ env.SELECTOR_LABEL }}
-          SEL_VALUE: ${{ env.SELECTOR_VALUE }}
+          NS:         ${{ env.EKS_NAMESPACE }}
+          PROM_NS:    ${{ env.PROM_NAMESPACE }}
+          PROM_SVC:   ${{ env.PROM_SERVICE_NAME }}
+          THRESHOLD:  ${{ env.RISK_THRESHOLD }}
+          SEL_VALUE:  ${{ env.SELECTOR_VALUE }}
           RETRY_COUNT: 5
         shell: bash
         run: |
           set -euo pipefail
-          attempt=1
-          max_attempts=${RETRY_COUNT:-3}
-          
+
+          start_pf() {
+            kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom.log 2>&1 &
+            echo $! > /tmp/pf_prom.pid
+            for i in {1..60}; do
+              curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1
+            done
+          }
+          stop_pf() { kill "$(cat /tmp/pf_prom.pid)" 2>/dev/null || true; }
+
+          query_avg() {
+            local q="$1"
+            local r
+            r="$(curl -sG 'http://127.0.0.1:9090/api/v1/query' --data-urlencode "query=$q")"
+            echo "$r" | jq '[.data.result[].value[1] | tonumber] | if length>0 then add/length else 0 end'
+          }
+
+          attempt=1; max_attempts=${RETRY_COUNT:-3}
           while [ $attempt -le $max_attempts ]; do
             echo "Attempt $attempt/$max_attempts to collect metrics"
-            
-            # Start Prometheus port-forward
-            kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom.log 2>&1 &
-            PROM_PID=$!
-            trap "kill $PROM_PID 2>/dev/null || true" EXIT
-            
-            # Wait for Prometheus readiness
-            for i in {1..30}; do
-              curl -sf http://localhost:9090/-/ready >/dev/null && break || sleep 2
-            done
+            start_pf
 
-            # Query function with retries
-            query_prometheus() {
-              local query="$1"
-              local retries=3
-              local result=""
-              
-              while [ $retries -gt 0 ]; do
-                result=$(curl -sG "http://localhost:9090/api/v1/query" \
-                  --data-urlencode "query=$query" \
-                  -H "Accept: application/json")
-                
-                if echo "$result" | jq -e '.data.result[0].value[1] | tonumber? // empty' >/dev/null; then
-                  echo "$result"
-                  return 0
-                fi
-                
-                retries=$((retries-1))
-                sleep 5
-              done
-              
-              echo "{}"
-              return 1
-            }
+            cpu_query="rate(container_cpu_usage_seconds_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\",container!=\"POD\"}[2m]) * 100"
+            mem_query="avg(container_memory_working_set_bytes{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\",container!=\"POD\"})"
+            rst_query="increase(kube_pod_container_status_restarts_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[5m])"
+            rdy_query="kube_deployment_status_replicas_ready{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"}/clamp_min(kube_deployment_spec_replicas{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"},1)"
+            una_query="kube_deployment_status_replicas_unavailable{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"}"
+            net_query="rate(container_network_receive_bytes_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[2m])"
+            err_query="sum(rate(flask_http_request_total{status=~\"5..\",namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[2m]))"
 
-            # Fetch metrics
-            cpu_query="rate(container_cpu_usage_seconds_total{namespace=\"$NS\",pod=~\"$SEL_VALUE-.*\"}[2m]) * 100"
-            cpu_data=$(query_prometheus "$cpu_query")
-            cpu_value=$(echo "$cpu_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            mem_query="avg(container_memory_usage_bytes{namespace=\"$NS\",pod=~\"$SEL_VALUE-.*\"})"
-            mem_data=$(query_prometheus "$mem_query")
-            mem_value=$(echo "$mem_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            restart_query="increase(kube_pod_container_status_restarts_total{namespace=\"$NS\",pod=~\"$SEL_VALUE-.*\"}[5m])"
-            restart_data=$(query_prometheus "$restart_query")
-            restart_value=$(echo "$restart_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            ready_query="kube_deployment_status_replicas_ready{namespace=\"$NS\",deployment=\"$BACKEND_DEPLOY\"} / kube_deployment_spec_replicas{namespace=\"$NS\",deployment=\"$BACKEND_DEPLOY\"}"
-            ready_data=$(query_prometheus "$ready_query")
-            ready_value=$(echo "$ready_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            unavail_query="kube_deployment_status_replicas_unavailable{namespace=\"$NS\",deployment=\"$BACKEND_DEPLOY\"}"
-            unavail_data=$(query_prometheus "$unavail_query")
-            unavail_value=$(echo "$unavail_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            net_query="rate(container_network_receive_bytes_total{namespace=\"$NS\",pod=~\"$SEL_VALUE-.*\"}[2m])"
-            net_data=$(query_prometheus "$net_query")
-            net_value=$(echo "$net_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
-            
-            error_query="rate(http_server_errors_total{namespace=\"$NS\",pod=~\"$SEL_VALUE-.*\"}[2m])"
-            error_data=$(query_prometheus "$error_query")
-            error_value=$(echo "$error_data" | jq '[.data.result[].value[1] | tonumber] | if length > 0 then add / length else 0 end')
+            cpu=$(query_avg "$cpu_query")
+            mem=$(query_avg "$mem_query")
+            rst=$(query_avg "$rst_query")
+            rdy=$(query_avg "$rdy_query")
+            una=$(query_avg "$una_query")
+            net=$(query_avg "$net_query")
+            err=$(query_avg "$err_query")
 
             features=$(jq -n \
-              --argjson cpu "$cpu_value" \
-              --argjson mem "$mem_value" \
-              --argjson restart "$restart_value" \
-              --argjson ready "$ready_value" \
-              --argjson unavail "$unavail_value" \
-              --argjson netin "$net_value" \
-              --argjson error5xx "$error_value" \
+              --argjson cpu "$cpu" \
+              --argjson mem "$mem" \
+              --argjson rst "$rst" \
+              --argjson rdy "$rdy" \
+              --argjson una "$una" \
+              --argjson net "$net" \
+              --argjson err "$err" \
               '{
-                restart_count_last_5m: $restart,
+                restart_count_last_5m: $rst,
                 cpu_usage_pct: $cpu,
                 memory_usage_bytes: $mem,
-                ready_replica_ratio: $ready,
-                unavailable_replicas: $unavail,
-                network_receive_bytes_per_s: $netin,
-                http_5xx_error_rate: $error5xx
+                ready_replica_ratio: $rdy,
+                unavailable_replicas: $una,
+                network_receive_bytes_per_s: $net,
+                http_5xx_error_rate: $err
               }')
-
             echo "Features: $features"
 
-            # Check if we have non-zero metrics
-            if jq -e '.[] | select(. > 0)' <<< "$features" | grep -q .; then
+            if jq -e '.[] | select(. > 0)' <<< "$features" >/dev/null; then
               echo "✅ Valid metrics obtained"
+              stop_pf
               break
             else
               echo "⚠️ All metrics zero - retrying in 20s"
-              kill $PROM_PID
+              stop_pf
               sleep 20
               ((attempt++))
             fi
           done
-          
+
           if [ $attempt -gt $max_attempts ]; then
             echo "❌ All metric queries returned zero after $max_attempts attempts"
             exit 1
           fi
 
-          kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend2.log 2>&1 &
-          BACKEND_PID=$!
-          trap "kill $BACKEND_PID 2>/dev/null || true" EXIT
+          # Call backend /predict via local PF
+          kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend.log 2>&1 &
+          B_PID=$!
           for i in {1..30}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 2; done
 
-          # Add retry logic for prediction request
-          max_retries=3
-          retry_count=0
-          while [ $retry_count -lt $max_retries ]; do
-            RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                   -H "Content-Type: application/json" -d "${features}") && break
-            retry_count=$((retry_count+1))
+          max_retries=3; retry_count=0
+          until RESP=$(curl -s -X POST http://127.0.0.1:5000/predict -H "Content-Type: application/json" -d "${features}"); do
+            (( retry_count++ ))
+            [ $retry_count -ge $max_retries ] && break
             sleep 5
           done
-          
+
+          kill $B_PID 2>/dev/null || true
+
           echo "Predict: $RESP"
           PROB=$(echo "$RESP" | jq -r '.probability // 0')
           LOADED=$(echo "$RESP" | jq -r '.model_loaded // false')
 
           echo "fail_prob=$PROB" >> $GITHUB_OUTPUT
           echo "model_loaded=${LOADED}" >> $GITHUB_OUTPUT
-
-          if [ "${LOADED}" = "true" ] && awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}'; then
-            echo "highrisk=true"  >> $GITHUB_OUTPUT
-          else
-            echo "highrisk=false" >> $GITHUB_OUTPUT
-          fi
+          awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}' \
+            && echo "highrisk=true"  >> $GITHUB_OUTPUT \
+            || echo "highrisk=false" >> $GITHUB_OUTPUT
 
       - name: Auto-heal (rollout restart)
         if: ${{ steps.predict.outputs.highrisk == 'true' && steps.predict.outputs.model_loaded == 'true' }}
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout restart deployment/${BACKEND_DEPLOY}
-          kubectl -n "${EKS_NAMESPACE}" rollout status deployment/${BACKEND_DEPLOY} --timeout=5m
+          kubectl -n "${EKS_NAMESPACE}" rollout status  deployment/${BACKEND_DEPLOY} --timeout=5m
 
       - name: Re-check risk after heal
         id: recheck
         if: ${{ steps.predict.outputs.highrisk == 'true' }}
         env:
-          NS:        ${{ env.EKS_NAMESPACE }}
-          PROM_NS:   ${{ env.PROM_NAMESPACE }}
-          PROM_SVC:  ${{ env.PROM_SERVICE_NAME }}
-          THRESHOLD: ${{ env.RISK_THRESHOLD }}
-          SEL_LABEL: ${{ env.SELECTOR_LABEL }}
-          SEL_VALUE: ${{ env.SELECTOR_VALUE }}
+          NS:         ${{ env.EKS_NAMESPACE }}
+          PROM_NS:    ${{ env.PROM_NAMESPACE }}
+          PROM_SVC:   ${{ env.PROM_SERVICE_NAME }}
+          THRESHOLD:  ${{ env.RISK_THRESHOLD }}
+          SEL_VALUE:  ${{ env.SELECTOR_VALUE }}
         run: |
           set -euo pipefail
-          sleep 120  # Increased from 60s for metrics stabilization
+          sleep 120
 
           kubectl -n "$PROM_NS" port-forward svc/"$PROM_SVC" 9090:9090 >/tmp/pf-prom2.log 2>&1 &
-          PROM_PID=$!
-          trap "kill $PROM_PID 2>/dev/null || true" EXIT
-          for i in {1..30}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 2; done
+          PF2=$!
+          for i in {1..60}; do curl -sf http://127.0.0.1:9090/-/ready >/dev/null && break || sleep 1; done
 
-          FEATURES=$(python3 - <<'PY'
-          import json,requests,os
-          ns=os.getenv("NS")
-          label=os.getenv("SEL_LABEL","app")
-          val=os.getenv("SEL_VALUE","backend")
-          url="http://127.0.0.1:9090/api/v1/query"
+          qavg() { curl -sG 'http://127.0.0.1:9090/api/v1/query' --data-urlencode "query=$1" | jq '[.data.result[].value[1]|tonumber] | if length>0 then add/length else 0 end'; }
 
-          def q(e):
-              return requests.get(url,params={'query':e},timeout=15).json()
-          def val_of(js, default=0.0):
-              try:
-                  return float(js['data']['result'][0]['value'][1])
-              except Exception:
-                  return default
+          cpu=$(qavg "rate(container_cpu_usage_seconds_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\",container!=\"POD\"}[2m]) * 100")
+          mem=$(qavg "avg(container_memory_working_set_bytes{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\",container!=\"POD\"})")
+          rst=$(qavg "increase(kube_pod_container_status_restarts_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[5m])")
+          rdy=$(qavg "kube_deployment_status_replicas_ready{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"}/clamp_min(kube_deployment_spec_replicas{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"},1)")
+          una=$(qavg "kube_deployment_status_replicas_unavailable{namespace=\"${NS}\",deployment=\"${BACKEND_DEPLOY}\"}")
+          net=$(qavg "rate(container_network_receive_bytes_total{namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[2m])")
+          err=$(qavg "sum(rate(flask_http_request_total{status=~\"5..\",namespace=\"${NS}\",pod=~\"${SEL_VALUE}-.*\"}[2m]))")
 
-          lbl = "label_" + label.replace('.', '_').replace('/', '_')
-          L = f'kube_pod_labels{{namespace="{ns}", {lbl}="{val}"}}'
-          def sum_on_pod(expr):
-              return f'sum(({expr}) * on (namespace,pod) group_left({lbl}) ({L}))'
+          FEATURES=$(jq -n --argjson cpu "$cpu" --argjson mem "$mem" --argjson rst "$rst" \
+            --argjson rdy "$rdy" --argjson una "$una" --argjson net "$net" --argjson err "$err" \
+            '{restart_count_last_5m:$rst,cpu_usage_pct:$cpu,memory_usage_bytes:$mem,ready_replica_ratio:$rdy,unavailable_replicas:$una,network_receive_bytes_per_s:$net,http_5xx_error_rate:$err}')
 
-          cpu = val_of(q(sum_on_pod(f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!="POD",image!=""}}[2m])'))) * 100
-          mem = val_of(q(sum_on_pod(f'container_memory_working_set_bytes{{namespace="{ns}",container!="POD",image!=""}}')))
-
-          net = val_of(q(sum_on_pod(f'rate(container_network_receive_bytes_total{{namespace="{ns}",pod!=""}}[2m])')))
-          restarts = val_of(q(sum_on_pod(f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}"}}[5m])')))
-
-          dep_lbl_sum = f'sum by (namespace, deployment, {lbl}) (kube_deployment_labels{{namespace="{ns}", {lbl}="{val}"}})'
-          desired = val_of(q(f'sum(kube_deployment_spec_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
-          ready = val_of(q(f'sum(kube_deployment_status_ready_replicas{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
-          unavail = val_of(q(f'sum(kube_deployment_status_replicas_unavailable{{namespace="{ns}"}} * on (namespace, deployment) group_left({lbl}) ({dep_lbl_sum}))'))
-          ratio = (ready/desired) if desired>0 else 1.0
-
-          http5xx = 0.0
-          for num,den in [
-            ('http_requests_total{code=~"5.."}','http_requests_total'),
-            ('flask_http_request_total{status=~"5.."}','flask_http_request_total'),
-          ]:
-              try:
-                  n = val_of(q(sum_on_pod(f'rate({num}[2m])'))
-                  d = val_of(q('clamp_min('+sum_on_pod(f'rate({den}[2m])')+', 1)'))
-                  if d>0 and n/d>0:
-                      http5xx = n/d
-                      break
-              except Exception:
-                  pass
-
-          print(json.dumps({
-            "restart_count_last_5m": restarts,
-            "cpu_usage_pct": cpu,
-            "memory_usage_bytes": mem,
-            "ready_replica_ratio": round(ratio,4),
-            "unavailable_replicas": unavail,
-            "network_receive_bytes_per_s": net,
-            "http_5xx_error_rate": http5xx
-          }))
-          PY
-          )
+          kill $PF2 2>/dev/null || true
 
           kubectl -n "${NS}" port-forward svc/${BACKEND_SERVICE} 5000:5000 >/tmp/pf-backend3.log 2>&1 &
-          BACKEND_PID=$!
-          trap "kill $BACKEND_PID 2>/dev/null || true" EXIT
+          B3=$!
           for i in {1..30}; do curl -sf http://127.0.0.1:5000/healthz >/dev/null && break || sleep 2; done
 
-          # Add retry logic for prediction request
-          max_retries=3
-          retry_count=0
-          while [ $retry_count -lt $max_retries ]; do
-            RESP=$(curl -s -X POST http://127.0.0.1:5000/predict \
-                   -H "Content-Type: application/json" -d "${FEATURES}") && break
-            retry_count=$((retry_count+1))
-            sleep 5
-          done
-          
+          RESP=$(curl -s -X POST http://127.0.0.1:5000/predict -H "Content-Type: application/json" -d "${FEATURES}" || echo '{}')
+          kill $B3 2>/dev/null || true
+
           PROB=$(echo "$RESP" | jq -r '.probability // 0')
           echo "fail_prob2=$PROB" >> $GITHUB_OUTPUT
-
           awk -v p="$PROB" -v thr="${THRESHOLD}" 'BEGIN{exit !(p>=thr)}' \
             && echo "still_high=true"  >> $GITHUB_OUTPUT \
             || echo "still_high=false" >> $GITHUB_OUTPUT
@@ -491,7 +398,7 @@ jobs:
             msg="✅ Rollout kept. Risk p=${{ steps.predict.outputs.fail_prob }}."
             printf '%s\n' "$msg" | jq -Rs '{text: .}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
           fi
-      
+
       - name: Cleanup resources
         if: always()
         run: |

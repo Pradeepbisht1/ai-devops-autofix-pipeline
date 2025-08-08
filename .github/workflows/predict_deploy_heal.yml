@@ -376,7 +376,11 @@ jobs:
         if: ${{ steps.recheck.outputs.still_high == 'true' }}
         run: |
           kubectl -n "${EKS_NAMESPACE}" rollout undo deployment/${BACKEND_DEPLOY}
-          # reset heal-attempt annotation so next run starts fresh
+          kubectl -n "${EKS_NAMESPACE}" annotate deployment/${BACKEND_DEPLOY} healing.attempt- || true
+
+      - name: Reset heal attempts when healed
+        if: ${{ steps.predict.outputs.highrisk == 'true' && steps.recheck.outputs.still_high != 'true' }}
+        run: |
           kubectl -n "${EKS_NAMESPACE}" annotate deployment/${BACKEND_DEPLOY} healing.attempt- || true
 
       - name: Slack alert (high → healed)

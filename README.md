@@ -6,27 +6,29 @@ End‑to‑end, production‑grade example that builds a **ML‑driven risk pred
 
 ## Table of Contents
 
-- [Architecture](#architecture)
-- [Repository Layout](#repository-layout)
-- [Features](#features)
-- [Requirements](#requirements)
-- [One‑Time AWS/EKS Setup](#one-time-awseks-setup)
-- [GitHub Secrets](#github-secrets)
-- [Local Development](#local-development)
-  - [Backend (Flask API)](#backend-flask-api)
-  - [Frontend (Risk Dashboard)](#frontend-risk-dashboard)
-- [Kubernetes Manifests](#kubernetes-manifests)
-- [Prometheus & Metrics](#prometheus--metrics)
-- [GitHub Actions Pipeline](#github-actions-pipeline)
-  - [What it does](#what-it-does)
-  - [Risk → Auto‑Heal Flow](#risk--auto-heal-flow)
-  - [Tuning Risk Threshold](#tuning-risk-threshold)
-- [RBAC & aws‑auth Mapping](#rbac--aws-auth-mapping)
-- [Operational Playbook](#operational-playbook)
-- [Troubleshooting](#troubleshooting)
-- [Security & Prod Hardening](#security--prod-hardening)
-- [Cost & Cleanup](#cost--cleanup)
-- [License](#license)
+- [AI‑DevOps: Predict, Deploy \& Auto‑Heal Pipeline](#aidevops-predict-deploy--autoheal-pipeline)
+  - [Table of Contents](#table-of-contents)
+  - [Architecture](#architecture)
+  - [Repository Layout](#repository-layout)
+  - [Features](#features)
+  - [Requirements](#requirements)
+  - [One‑Time AWS/EKS Setup](#onetime-awseks-setup)
+  - [GitHub Secrets](#github-secrets)
+  - [Local Development](#local-development)
+    - [Backend (Flask API)](#backend-flask-api)
+    - [Frontend (Risk Dashboard)](#frontend-risk-dashboard)
+  - [Kubernetes Manifests](#kubernetes-manifests)
+  - [Prometheus \& Metrics](#prometheus--metrics)
+  - [GitHub Actions Pipeline](#github-actions-pipeline)
+    - [What it does](#what-it-does)
+    - [Risk → Auto‑Heal Flow](#risk--autoheal-flow)
+    - [Tuning Risk Threshold](#tuning-risk-threshold)
+  - [RBAC \& aws‑auth Mapping](#rbac--awsauth-mapping)
+  - [Operational Playbook](#operational-playbook)
+  - [Troubleshooting](#troubleshooting)
+  - [Security \& Prod Hardening](#security--prod-hardening)
+  - [Cost \& Cleanup](#cost--cleanup)
+  - [License](#license)
 
 ---
 
@@ -251,7 +253,7 @@ File: `.github/workflows/ci.yml` (name: **Predict, Deploy & Auto‑Heal Pipeline
 6. Deploy a small **loadgen** to keep traffic flowing
 7. **Port‑forward Prometheus**, query metrics → build features JSON
 8. Port‑forward **backend** and call `/predict`
-9. If **probability ≥ `RISK_THRESHOLD`** (default **0.70**): trigger **auto‑healing**
+9. If **probability ≥ `RISK_THRESHOLD`** (default **0.50**): trigger **auto‑healing**
 10. Re‑check risk after **120s**:
     - If still high → **rollback**
     - Else → keep rollout
@@ -464,3 +466,4 @@ MIT (or your org’s standard). Update as required.
 ---
 
 > **Tip**: For quick end‑to‑end test in a fresh cluster, run the GitHub Action manually (workflow_dispatch) and watch the logs for **Predict → Auto‑Heal → Re‑check** transitions.
+ 
